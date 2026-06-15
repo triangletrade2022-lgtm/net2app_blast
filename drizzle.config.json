@@ -1,0 +1,7 @@
+{
+  "dialect": "postgresql",
+  "schema": "./src/db/schema.ts",
+  "dbCredentials": {
+    "url": "postgresql://net2app_user:Ariyax2024Net2AppDB@127.0.0.1:5432/net2app_db"
+  }
+}

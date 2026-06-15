@@ -1,0 +1,14 @@
+node_modules/
+.next/
+*.log
+logs/
+.env
+.env.local
+CREDENTIALS.txt
+__pycache__/
+*.pyc
+smpp_env/
+*.egg-info/
+dist/
+build/
+.vercel
