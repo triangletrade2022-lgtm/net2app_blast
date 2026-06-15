@@ -237,6 +237,25 @@ curl http://localhost:3000/api/health
 3. Go to **Clients** → Add clients with rates
 4. Go to **Suppliers** → Verify SMS Sheba is active
 5. Go to **Test SMS** → Send a test message
+6. Go to **SMSC Status** (`/smpp/status`) → Verify supplier connections
+
+### SMSC Monitoring
+
+```bash
+# Add SMSC monitor to crontab (checks every 5 minutes)
+crontab -e
+# Add this line:
+*/5 * * * * /home/ubuntu/net2app-platform/scripts/smsc-monitor.sh
+
+# Monitor logs
+tail -f /home/ubuntu/net2app-platform/logs/smsc-monitor.log
+```
+
+The SMSC status page at `/smpp/status` provides a real-time dashboard showing:
+- Overall SMSC health indicator (all bound → green, partial → yellow, none → red)
+- Per-supplier connection status cards with bound/unbound indicators
+- ESME client session list (IP, system ID, bind status)
+- Auto-refreshes every 5 seconds
 
 ---
 
