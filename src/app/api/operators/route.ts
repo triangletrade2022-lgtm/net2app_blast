@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { operators, countries } from "@/db/schema";
 import { eq, asc } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET(req: NextRequest) {
   try {
@@ -40,8 +41,7 @@ export async function GET(req: NextRequest) {
       .orderBy(asc(operators.name));
     return NextResponse.json(result);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -59,7 +59,6 @@ export async function POST(req: NextRequest) {
     }).returning();
     return NextResponse.json(created, { status: 201 });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { routes, routeTrunks, clients, trunks, suppliers, countries, operators } from "@/db/schema";
 import { eq, desc } from "drizzle-orm";
 import { generateCode } from "@/lib/helpers";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET() {
   try {
@@ -29,8 +30,7 @@ export async function GET() {
       .orderBy(desc(routes.createdAt));
     return NextResponse.json(result);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -50,7 +50,6 @@ export async function POST(req: NextRequest) {
     }).returning();
     return NextResponse.json(created, { status: 201 });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

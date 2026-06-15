@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { clients, suppliers, smsLogs } from "@/db/schema";
 import { eq, desc, sql } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET(req: NextRequest) {
   try {

@@ -4,6 +4,7 @@ import { users, countries, operators, license, suppliers, apiProviders } from "@
 import { hashPassword } from "@/lib/auth";
 import { COUNTRIES_OPERATORS, BD_API_PROVIDERS } from "@/lib/helpers";
 import { eq } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function POST() {
   try {
@@ -117,7 +118,6 @@ export async function POST() {
 
     return NextResponse.json({ success: true, message: "Database seeded successfully" });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

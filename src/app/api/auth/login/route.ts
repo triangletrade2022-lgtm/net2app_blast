@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { users, loginHistory } from "@/db/schema";
 import { eq, or } from "drizzle-orm";
 import { verifyPassword, generateToken } from "@/lib/auth";
+import { handleApiError } from "@/lib/api-error";
 
 export async function POST(req: NextRequest) {
   const clientIp = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || "unknown";
@@ -103,6 +104,6 @@ export async function POST(req: NextRequest) {
       success: false,
       failReason: msg,
     });
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

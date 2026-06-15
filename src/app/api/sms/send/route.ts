@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { smsLogs, clients, suppliers, routes, routeTrunks, trunks, clientRates, supplierRates, license, dlrQueue } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { generateMessageId, calculateSmsParts } from "@/lib/helpers";
+import { handleApiError } from "@/lib/api-error";
 import {
   isStatusCodeDelivered,
   getSupplierStatusDescription,
@@ -244,7 +245,7 @@ export async function POST(req: NextRequest) {
       status: finalStatus,
     });
   } catch (e: unknown) {
-    return NextResponse.json({ error: e instanceof Error ? e.message : "Unknown error" }, { status: 500 });
+    return handleApiError(e);
   }
 }
 

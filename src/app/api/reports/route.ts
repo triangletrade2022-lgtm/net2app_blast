@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { smsLogs, clients, suppliers, routes, invoices, clientRates, supplierRates } from "@/db/schema";
 import { eq, sql, gte, lte, and, desc } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET(req: NextRequest) {
   try {
@@ -149,7 +150,6 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ error: "Invalid report type" }, { status: 400 });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

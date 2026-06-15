@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { users } from "@/db/schema";
 import { hashPassword } from "@/lib/auth";
 import { desc } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET() {
   try {
@@ -13,8 +14,7 @@ export async function GET() {
     }).from(users).orderBy(desc(users.createdAt));
     return NextResponse.json(result);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -35,7 +35,6 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json(created, { status: 201 });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

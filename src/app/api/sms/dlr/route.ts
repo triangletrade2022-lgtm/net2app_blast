@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { smsLogs, dlrQueue } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function POST(req: NextRequest) {
   try {
@@ -38,8 +39,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ success: true });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -57,7 +57,6 @@ export async function GET(req: NextRequest) {
       deliverResult: log.deliverResult,
     });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

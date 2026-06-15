@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { license } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { verifyPassword, hashPassword } from "@/lib/auth";
+import { handleApiError } from "@/lib/api-error";
 
 const PACKAGE_VOLUMES: Record<string, number> = {
   trial: 5000,
@@ -25,7 +26,7 @@ export async function GET() {
       packageVolumes: PACKAGE_VOLUMES,
     });
   } catch (e: unknown) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -97,6 +98,6 @@ export async function PUT(req: NextRequest) {
       packageVolumes: PACKAGE_VOLUMES,
     });
   } catch (e: unknown) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return handleApiError(e);
   }
 }

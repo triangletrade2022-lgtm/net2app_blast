@@ -13,25 +13,26 @@ import io
 import json
 import logging
 import os
+import random
 import signal
-import socket
+import ssl
 import struct
 import sys
-import threading
 import time
 import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from threading import Event, Thread
 from typing import Optional
 
 from smppy import Application, SmppClient
 from smppy.server import SmppProtocol
 from smpp.pdu.operations import (
-    BindTransceiver, SubmitSM, EnquireLink, Unbind, DeliverSM,
-    BindTransceiverResp, UnbindResp, SubmitSMResp,
+    BindTransceiver, BindTransmitter, BindReceiver,
+    SubmitSM, EnquireLink, Unbind, DeliverSM,
+    BindTransceiverResp, BindTransmitterResp, BindReceiverResp,
+    UnbindResp, SubmitSMResp,
 )
 from smpp.pdu.pdu_encoding import PDUEncoder
 from smpp.pdu.pdu_types import (
@@ -40,8 +41,71 @@ from smpp.pdu.pdu_types import (
     RegisteredDelivery, RegisteredDeliveryReceipt,
     PriorityFlag, ReplaceIfPresentFlag,
     DataCodingDefault, DataCoding,
+    MoreMessagesToSend,
 )
 from smpp.pdu.sm_encoding import SMStringEncoder
+
+# ─── SMPP Integer-to-String Command ID mapping ───
+# The smpp library uses string-based CommandIds (e.g. 'bind_transceiver_resp').
+# When we parse raw PDU headers, we get integer command IDs that need to be
+# mapped to the string names the library expects.
+_SMPP_CMD_MAP = {
+    0x00000001: 'bind_receiver', 0x80000001: 'bind_receiver_resp',
+    0x00000002: 'bind_transmitter', 0x80000002: 'bind_transmitter_resp',
+    0x00000004: 'submit_sm', 0x80000004: 'submit_sm_resp',
+    0x00000005: 'deliver_sm', 0x80000005: 'deliver_sm_resp',
+    0x00000006: 'unbind', 0x80000006: 'unbind_resp',
+    0x00000007: 'replace_sm', 0x80000007: 'replace_sm_resp',
+    0x00000008: 'cancel_sm', 0x80000008: 'cancel_sm_resp',
+    0x00000009: 'bind_transceiver', 0x80000009: 'bind_transceiver_resp',
+    0x0000000b: 'outbind',
+    0x00000014: 'enquire_link', 0x80000014: 'enquire_link_resp',
+    0x00000015: 'enquire_link', 0x80000015: 'enquire_link_resp',
+    0x00000100: 'generic_nack', 0x80000100: 'generic_nack',
+}
+
+# SMPP status code to string mapping
+_SMPP_STATUS_MAP = {
+    0x00000000: 'ESME_ROK',
+    0x00000001: 'ESME_RINVMSGLEN',
+    0x00000002: 'ESME_RINVCMDLEN',
+    0x00000003: 'ESME_RINVCMDID',
+    0x00000004: 'ESME_RINVBNDSTS',
+    0x00000005: 'ESME_RINVRSVPAD',
+    0x00000006: 'ESME_RINVSRCADR',
+    0x00000007: 'ESME_RINVDSTADR',
+    0x00000008: 'ESME_RINVMSGID',
+    0x0000000a: 'ESME_RINVPRTFLG',
+    0x0000000b: 'ESME_RINVREPFLG',
+    0x0000000c: 'ESME_RINVADRTON',
+    0x0000000d: 'ESME_RBINDFAIL',
+    0x0000000e: 'ESME_RINVESMCLASS',
+    0x0000000f: 'ESME_RINVSERTYP',
+    0x00000010: 'ESME_RINVSRCTON',
+    0x00000011: 'ESME_RINVSRCNPI',
+    0x00000012: 'ESME_RINVDSTTON',
+    0x00000013: 'ESME_RINVDSTNPI',
+    0x00000014: 'ESME_RINVSRVCODE',
+    0x00000066: 'ESME_RINVOPTPARSTREAM',
+    0x00000067: 'ESME_ROPTPARNOTALLWD',
+    0x00000068: 'ESME_RINVPARLEN',
+    0x00000069: 'ESME_RMISSINGOPTPARAM',
+    0x0000006a: 'ESME_RINVOPTPARAMVAL',
+    0x000000ff: 'ESME_RDELIVERFAILURE',
+    0x00000100: 'ESME_RMAXQUEUEEXCEEDED',
+    0x00000101: 'ESME_RMSGQFUL',
+    0x00000400: 'ESME_RINVCERTLEN',
+    0x00000401: 'ESME_RINVCERTEXPIRED',
+    0x00000402: 'ESME_RINVCERTPATH',
+    0x00000403: 'ESME_RINVCERTID',
+    0x00000404: 'ESME_RINVSQLENGTH',
+    0x00000405: 'ESME_RINVTLVSTREAM',
+    0x00000406: 'ESME_RINVTLVALLOWED',
+    0x00000407: 'ESME_RINVTLVLEN',
+    0x00000408: 'ESME_RMISSINGTLV',
+    0x00000409: 'ESME_RINVTLVVAL',
+    0x000000c8: 'ESME_RDELIVERFAILURE',  # 200 decimal
+}
 
 os.makedirs('/home/ubuntu/net2app-platform/logs', exist_ok=True)
 logging.basicConfig(
@@ -60,11 +124,10 @@ DB_CONFIG = {
     'password': 'Ariyax2024Net2AppDB',
 }
 
-SMPP_CONFIG = {
-    'server_host': '0.0.0.0', 'server_port': 2775,
-    'supplier_host': '5.78.72.23', 'supplier_port': 2775,
-    'supplier_system_id': 'net2hub', 'supplier_password': 'net2hub',
-}
+ESMC_HOST = '0.0.0.0'
+ESMC_PORT = 2775
+
+
 
 
 # ─── Helper: nested field access for JSON response parsing ───
@@ -146,13 +209,46 @@ class DatabaseBridge:
             "SELECT id, name, client_code, smpp_system_id, smpp_password, "
             "smpp_host, smpp_port, max_tps, is_active, "
             "current_balance, credit_limit, billing_type, "
-            "force_dlr, force_dlr_status, dlr_callback_url "
+            "force_dlr, force_dlr_status, force_dlr_timeout, dlr_callback_url, "
+            "allowed_ips "
             "FROM clients "
             "WHERE smpp_system_id=%s AND smpp_password=%s AND is_active=true AND connection_type='smpp'",
             (system_id, password))
         return dict(zip(desc, row)) if row else None
 
+    def check_ip_allowed(self, allowed_ips_str: str, client_ip: str) -> bool:
+        """Check if a client IPv4 is allowed based on comma-separated whitelist.
+        Supports: single IPs (1.2.3.4), CIDR (1.2.3.0/24), wildcards (1.2.3.*).
+        Empty = no restriction.
+        """
+        if not allowed_ips_str or not allowed_ips_str.strip():
+            return True
+        allowed_list = [ip.strip() for ip in allowed_ips_str.split(',') if ip.strip()]
+        if not allowed_list:
+            return True
+        # Strip port from IPv4:port if present
+        client_ip = client_ip.split(':')[0] if ':' in client_ip else client_ip
+        for entry in allowed_list:
+            if entry == client_ip:
+                return True
+            # Wildcard: 192.168.1.*
+            if '*' in entry:
+                prefix = entry.replace('*', '').rstrip('.')
+                if client_ip.startswith(prefix):
+                    return True
+            # CIDR: 192.168.1.0/24
+            if '/' in entry:
+                try:
+                    import ipaddress
+                    if ipaddress.ip_address(client_ip) in ipaddress.ip_network(entry, strict=False):
+                        return True
+                except ValueError:
+                    pass
+        return False
+
     def get_route(self, client_id, mcc_mnc):
+        if isinstance(mcc_mnc, bytes):
+            mcc_mnc = mcc_mnc.decode('utf-8', errors='replace')
         row, desc = self._fetchone("""
             SELECT r.id as route_id, r.name as route_name,
                    rt.trunk_id, t.name as trunk_name,
@@ -165,17 +261,22 @@ class DatabaseBridge:
             JOIN trunks t ON t.id=rt.trunk_id AND t.is_active=true
             JOIN suppliers s ON s.id=rt.supplier_id AND s.is_active=true
             WHERE r.client_id=%s AND r.is_active=true
-            ORDER BY r.priority ASC, rt.priority ASC LIMIT 1""", (client_id,))
+              AND (r.mcc_mnc IS NULL OR r.mcc_mnc='' OR %s LIKE r.mcc_mnc || '%%')
+            ORDER BY CASE WHEN %s = r.mcc_mnc THEN 0 WHEN %s LIKE r.mcc_mnc || '%%' THEN 1 ELSE 2 END,
+                     r.priority ASC, rt.priority ASC LIMIT 1""",
+            (client_id, mcc_mnc, mcc_mnc, mcc_mnc))
         if row:
             return dict(zip(desc, row))
 
     def get_rate(self, table, entity_id, mcc_mnc):
+        if isinstance(mcc_mnc, bytes):
+            mcc_mnc = mcc_mnc.decode('utf-8', errors='replace')
         row, desc = self._fetchone(
             f"SELECT rate::numeric FROM {table} WHERE "
             f"{'client_id' if table=='client_rates' else 'supplier_id'}=%s "
-            f"AND (mcc_mnc=%s OR mcc_mnc IS NULL) AND is_active=true "
-            f"ORDER BY mcc_mnc=%s DESC LIMIT 1",
-            (entity_id, mcc_mnc, mcc_mnc))
+            f"AND (mcc_mnc IS NULL OR mcc_mnc='' OR %s LIKE mcc_mnc || '%%') AND is_active=true "
+            f"ORDER BY CASE WHEN %s = mcc_mnc THEN 0 WHEN %s LIKE mcc_mnc || '%%' THEN 1 ELSE 2 END LIMIT 1",
+            (entity_id, mcc_mnc, mcc_mnc, mcc_mnc))
         return float(row[0]) if row else 0.0
 
     def deduct_balance(self, table, entity_id, amount):
@@ -263,65 +364,159 @@ class DatabaseBridge:
             "ON CONFLICT (id) DO UPDATE SET bind_status=%s, last_activity=NOW()",
             ('client' if table == 'clients' else 'supplier', entity_id, system_id, status, addr, status))
 
+    def get_active_smpp_suppliers(self):
+        """Fetch all active SMPP suppliers from the database."""
+        rows = self._fetchall(
+            "SELECT id, name, smpp_system_id, smpp_password, smpp_host, smpp_port, "
+            "smpp_tls, smpp_bind_type, force_dlr, force_dlr_status "
+            "FROM suppliers WHERE connection_type='smpp' AND is_active=true "
+            "AND smpp_host IS NOT NULL AND smpp_system_id IS NOT NULL "
+            "ORDER BY priority ASC, id ASC")
+        if not rows:
+            return []
+        return [
+            {'id': r[0], 'name': r[1], 'system_id': r[2], 'password': r[3],
+             'host': r[4], 'port': r[5] or 2775, 'tls': bool(r[6]),
+             'bind_type': r[7] or 'transceiver',
+             'force_dlr': r[8], 'force_dlr_status': r[9]}
+            for r in rows
+        ]
+
 
 # ─── SMSC Supplier Client (using smpp.pdu directly) ───
 class SmppSupplierClient:
-    """TCP-based SMSC supplier using smpp.pdu for PDU encoding/decoding."""
+    """Async TCP-based SMSC supplier using smpp.pdu for PDU encoding/decoding.
+    Uses asyncio streams for non-blocking I/O, consistent with smppy patterns.
+    
+    Single BindTransceiver connection that handles both send (submit_sm)
+    and receive (deliver_sm/DLRs) as separate operations.
+    """
 
-    def __init__(self, host, port, system_id, password):
+    def __init__(self, host, port, system_id, password, bind_type='transceiver', tls=False):
         self.host = host
         self.port = port
         self.system_id = system_id
         self.password = password
-        self.sock: Optional[socket.socket] = None
+        self.bind_type = bind_type
+        self.tls = tls
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
         self.connected = False
         self._seq = 1
         self._encoder = PDUEncoder()
-        self._read_buf = b''
+        self._bind_mode = None  # 'transceiver', 'transmitter', 'receiver'
+        self._last_bind_status = None
 
     def next_seq(self):
         s = self._seq
         self._seq += 1
         return s
 
-    def connect_and_bind(self):
-        """Connect TCP and send bind_transceiver. Returns True on success."""
+    async def connect_and_bind(self):
+        """Connect TCP/TLS and bind. Returns True on success.
+        
+        Supports TLS connections (e.g. for Telnyx which requires TLS on port 2775).
+        Tries the configured bind_type in order:
+        - 'transceiver': tries transceiver first, falls back to transmitter
+        - 'transmitter': bind_transmitter only
+        - 'receiver': bind_receiver only
+        """
         try:
-            self.sock = socket.create_connection((self.host, self.port), timeout=10)
-            self.sock.settimeout(30)
+            if self.tls:
+                # Create SSL context with hostname verification
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = True
+                ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+                self.reader, self.writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port, ssl=ssl_ctx),
+                    timeout=10)
+                logger.info(f"SMSC: TLS connection established to {self.host}:{self.port}")
+            else:
+                self.reader, self.writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port), timeout=10)
 
-            pdu = BindTransceiver(
-                sequence_number=self.next_seq(),
-                system_id=self.system_id,
-                password=self.password,
-                system_type='',
-                interface_version=0x34,
-                addr_ton=AddrTon.UNKNOWN,
-                addr_npi=AddrNpi.UNKNOWN,
-            )
-            self.sock.sendall(self._encoder.encode(pdu))
-            logger.debug("SMSC: sent bind_transceiver")
+            if self.bind_type == 'receiver':
+                return await self._try_bind('receiver')
 
-            resp = self._read_pdu()
-            if resp is None:
+            # Try bind_transceiver first, fallback to bind_transmitter
+            if self.bind_type == 'transceiver':
+                if await self._try_bind('transceiver'):
+                    return True
+                # If RINVCMDID (supplier doesn't support transceiver), try transmitter
+                if self._last_bind_status in (CommandStatus.ESME_RINVCMDID, CommandStatus.ESME_RBINDFAIL):
+                    logger.info(f"SMSC: transceiver not supported for {self.system_id}, trying transmitter")
+                    return await self._try_bind('transmitter')
                 return False
 
-            if resp.command_id == CommandId.bind_transceiver_resp:
-                status = getattr(resp, 'status', CommandStatus.ESME_ROK)
-                if status == CommandStatus.ESME_ROK:
-                    self.connected = True
-                    logger.info(f"SMSC: bound as {self.system_id}")
-                    return True
-                else:
-                    logger.warning(f"SMSC: bind failed with status {status}")
-                    return False
+            # bind_transmitter only
+            return await self._try_bind('transmitter')
+
+        except asyncio.TimeoutError:
+            logger.error(f"SMSC connect timeout to {self.host}:{self.port}")
             return False
         except Exception as e:
             logger.error(f"SMSC connect/bind error: {e}")
             return False
 
-    def send_submit_sm(self, source_addr, destination_addr, short_message,
-                       registered_delivery=True):
+    async def _try_bind(self, mode: str) -> bool:
+        """Try a specific bind operation (transceiver, transmitter, or receiver)."""
+        if mode == 'transceiver':
+            pdu_cls = BindTransceiver
+            resp_cmd_id = CommandId.bind_transceiver_resp
+            mode_name = 'transceiver'
+        elif mode == 'transmitter':
+            pdu_cls = BindTransmitter
+            resp_cmd_id = CommandId.bind_transmitter_resp
+            mode_name = 'transmitter'
+        elif mode == 'receiver':
+            pdu_cls = BindReceiver
+            resp_cmd_id = CommandId.bind_receiver_resp
+            mode_name = 'receiver'
+        else:
+            return False
+
+        try:
+            pdu = pdu_cls(
+                sequence_number=self.next_seq(),
+                system_id=self.system_id,
+                password=self.password,
+                system_type='',
+                interface_version=0x34,
+                addr_ton=AddrTon.INTERNATIONAL,
+                addr_npi=AddrNpi.ISDN,
+            )
+            self.writer.write(self._encoder.encode(pdu))
+            await self.writer.drain()
+            logger.debug(f"SMSC: sent bind_{mode_name}")
+
+            resp = await self._read_pdu(timeout=10)
+            if resp is None:
+                self._last_bind_status = None
+                return False
+
+            if resp.command_id == resp_cmd_id:
+                status = getattr(resp, 'status', CommandStatus.ESME_ROK)
+                self._last_bind_status = status
+                if status == CommandStatus.ESME_ROK:
+                    self.connected = True
+                    self._bind_mode = mode
+                    logger.info(f"SMSC: bound as {self.system_id} ({mode_name}) [{self.host}:{self.port}]")
+                    return True
+                else:
+                    logger.warning(f"SMSC: bind_{mode_name} failed with status {status}")
+                    return False
+            # Wrong response command ID — might be a different bind response
+            # Check if it's a bind_transceiver_resp for a different bind type
+            self._last_bind_status = getattr(resp, 'status', CommandStatus.ESME_RINVCMDID)
+            logger.warning(f"SMSC: bind_{mode_name} got unexpected response cmd={resp.command_id} status={self._last_bind_status}")
+            return False
+        except Exception as e:
+            logger.error(f"SMSC bind_{mode_name} error: {e}")
+            self._last_bind_status = None
+            return False
+
+    async def send_submit_sm(self, source_addr, destination_addr, short_message,
+                             registered_delivery=True):
         """Send a submit_sm PDU. Returns (success, message_id_or_None)."""
         try:
             if isinstance(short_message, str):
@@ -354,15 +549,15 @@ class SmppSupplierClient:
                                        else DataCodingDefault.SMSC_DEFAULT_ALPHABET),
                 short_message=msg_bytes,
             )
-            self.sock.sendall(self._encoder.encode(pdu))
+            self.writer.write(self._encoder.encode(pdu))
+            await self.writer.drain()
 
-            resp = self._read_pdu(timeout=15)
+            resp = await self._read_pdu(timeout=15)
             if resp is None:
                 return False, None
 
             if resp.command_id == CommandId.submit_sm_resp:
                 status = getattr(resp, 'status', CommandStatus.ESME_ROK)
-                # msg_id can be a direct attribute or in params
                 msg_id = getattr(resp, 'message_id', None)
                 if msg_id is None and hasattr(resp, 'params'):
                     msg_id = resp.params.get('message_id', '')
@@ -377,21 +572,21 @@ class SmppSupplierClient:
             logger.error(f"SMSC submit_sm error: {e}")
             return False, None
 
-    def send_enquire_link(self):
+    async def send_enquire_link(self):
         """Send enquire_link. Returns True if response received."""
         try:
             pdu = EnquireLink(sequence_number=self.next_seq())
-            self.sock.sendall(self._encoder.encode(pdu))
-            resp = self._read_pdu(timeout=5)
+            self.writer.write(self._encoder.encode(pdu))
+            await self.writer.drain()
+            resp = await self._read_pdu(timeout=5)
             return resp is not None
         except:
             return False
 
-    def read_once(self):
+    async def read_once(self):
         """Read one PDU from the socket (non-blocking with short timeout)."""
         try:
-            self.sock.settimeout(0.5)
-            resp = self._read_pdu()
+            resp = await self._read_pdu(timeout=0.5)
             if resp is None:
                 return None
             # Handle DLR (deliver_sm from SMSC)
@@ -401,37 +596,59 @@ class SmppSupplierClient:
                     sequence_number=resp.sequence_number,
                     message_id=resp.params.get('message_id', '') if hasattr(resp, 'params') else '',
                 )
-                self.sock.sendall(self._encoder.encode(dlr_resp))
+                self.writer.write(self._encoder.encode(dlr_resp))
+                await self.writer.drain()
                 return resp
             return resp
-        except socket.timeout:
+        except asyncio.TimeoutError:
             return None
-        except:
+        except Exception:
             raise
 
-    def _read_pdu(self, timeout=10):
-        """Read a complete PDU from the socket."""
+    async def _read_pdu(self, timeout=10):
+        """Read a complete PDU from the socket using asyncio stream."""
         try:
-            self.sock.settimeout(timeout)
-            header = self._recv_exact(16)
+            header = await self._recv_exact(16, timeout)
             if not header or len(header) < 16:
                 return None
             length = struct.unpack('>I', header[:4])[0]
             body_len = length - 16
             body = b''
             if body_len > 0:
-                body = self._recv_exact(body_len)
+                body = await self._recv_exact(body_len, timeout)
             full = header + body
-            return PDUEncoder().decode(io.BytesIO(full))
+            # Try PDUEncoder first, fallback to manual decode
+            try:
+                return PDUEncoder().decode(io.BytesIO(full))
+            except Exception as enc_err:
+                # Fallback: manually decode the response header
+                cmd_id = struct.unpack('>I', header[4:8])[0]
+                cmd_status = struct.unpack('>I', header[8:12])[0]
+                seq = struct.unpack('>I', header[12:16])[0]
+                logger.warning(f"SMSC PDU decode error ({enc_err}), raw: len={length} cmd=0x{cmd_id:08x} status=0x{cmd_status:08x} seq={seq}")
+                # Return a simple object with the string-based fields the library expects
+                cmd_name = _SMPP_CMD_MAP.get(cmd_id, f'unknown_0x{cmd_id:08x}')
+                status_name = _SMPP_STATUS_MAP.get(cmd_status, f'ESME_0x{cmd_status:08x}')
+                class RawPdu:
+                    pass
+                resp = RawPdu()
+                resp.command_id = cmd_name
+                resp.command_status = status_name
+                setattr(resp, 'status', status_name)
+                resp.sequence_number = seq
+                return resp
+        except asyncio.TimeoutError:
+            return None
         except Exception as e:
             logger.debug(f"SMSC _read_pdu: {e}")
             return None
 
-    def _recv_exact(self, n):
-        """Receive exactly n bytes from socket."""
+    async def _recv_exact(self, n, timeout=10):
+        """Receive exactly n bytes from async stream reader."""
         buf = b''
         while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
+            chunk = await asyncio.wait_for(
+                self.reader.read(n - len(buf)), timeout=timeout)
             if not chunk:
                 return None
             buf += chunk
@@ -440,10 +657,273 @@ class SmppSupplierClient:
     def close(self):
         self.connected = False
         try:
-            if self.sock:
-                self.sock.close()
+            if self.writer:
+                self.writer.close()
         except:
             pass
+
+
+# ─── SMSC Supplier Manager (dynamic multi-supplier) ───
+class SmppSupplierManager:
+    """Manages persistent SMPP connections to all active upstream suppliers.
+    
+    Reads active SMPP suppliers from the database dynamically and maintains
+    a persistent connection to each one. Each supplier connection has its own
+    listen loop for DLR handling.
+    """
+
+    def __init__(self, gateway):
+        self.gateway = gateway
+        self.db = gateway.db
+        self.connections: dict[int, SmppSupplierClient] = {}
+        self.listen_tasks: dict[int, asyncio.Task] = {}
+        self.supplier_info: dict[int, dict] = {}
+        self.running = True
+        self.lock = asyncio.Lock()
+
+    async def connect_supplier(self, supplier: dict) -> bool:
+        """Connect to a single supplier and start its listen loop."""
+        sid = supplier['id']
+        try:
+            logger.info(f"SMSC: connecting to supplier {sid} ({supplier['name']}) at "
+                        f"{supplier['host']}:{supplier['port']}")
+
+            bind_type = supplier.get('bind_type', 'transceiver') or 'transceiver'
+            tls_enabled = supplier.get('tls', False)
+            client = SmppSupplierClient(
+                supplier['host'], supplier['port'],
+                supplier['system_id'], supplier['password'],
+                bind_type=bind_type,
+                tls=tls_enabled,
+            )
+
+            if await client.connect_and_bind():
+                async with self.lock:
+                    self.connections[sid] = client
+                    self.supplier_info[sid] = supplier
+                # Update bind status in DB
+                try:
+                    self.db.set_bind_status('suppliers', sid, 'bound',
+                                            supplier['system_id'],
+                                            f"{supplier['host']}:{supplier['port']}")
+                except Exception as e:
+                    logger.error(f"Failed to update bind status for supplier {sid}: {e}")
+
+                # Start listen loop for this supplier's DLRs
+                self.listen_tasks[sid] = asyncio.create_task(
+                    self._supplier_listen_loop(sid, client, supplier))
+                logger.info(f"✓ SMSC supplier {sid} ({supplier['name']}) connected and listening")
+                return True
+            else:
+                client.close()
+                return False
+
+        except Exception as e:
+            logger.error(f"SMSC connect supplier {sid} ({supplier.get('name', '')}): {e}")
+            return False
+
+    async def disconnect_supplier(self, sid: int):
+        """Disconnect from a supplier and clean up."""
+        logger.info(f"SMSC: disconnecting supplier {sid}")
+        # Cancel listen loop
+        task = self.listen_tasks.pop(sid, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # Close connection
+        async with self.lock:
+            client = self.connections.pop(sid, None)
+            self.supplier_info.pop(sid, None)
+        if client:
+            client.close()
+        # Update bind status
+        info = self.supplier_info.get(sid, {})
+        try:
+            self.db.set_bind_status('suppliers', sid, 'unbound',
+                                    info.get('system_id', ''),
+                                    f"{info.get('host', '')}:{info.get('port', '')}")
+        except:
+            pass
+
+    async def _supplier_listen_loop(self, sid: int, client: SmppSupplierClient,
+                                     supplier: dict):
+        """Listen loop for a single supplier connection — reads DLRs."""
+        listen_name = f"{supplier['name']}({sid})"
+        enquire_count = 0
+        while self.running and client.connected:
+            try:
+                pdu = await client.read_once()
+                if pdu is None:
+                    enquire_count += 1
+                else:
+                    enquire_count = 0
+
+                # Handle DLR from SMSC
+                if pdu and pdu.command_id == CommandId.deliver_sm:
+                    try:
+                        mid = getattr(pdu, 'message_id', None)
+                        if mid is None and hasattr(pdu, 'params'):
+                            mid = pdu.params.get('message_id', b'')
+                        if mid is None:
+                            mid = b''
+                        stat = getattr(pdu, 'stat', None)
+                        if stat is None and hasattr(pdu, 'params'):
+                            stat = pdu.params.get('stat', b'')
+                        if stat is None:
+                            stat = b''
+                        if isinstance(mid, bytes):
+                            mid = mid.decode('utf-8', errors='replace')
+                        if isinstance(stat, bytes):
+                            stat = stat.decode('utf-8', errors='replace')
+                        if mid:
+                            dlr_map = {'DELIVRD': 'delivered', 'DELIVERED': 'delivered',
+                                       'EXPIRED': 'expired', 'DELETED': 'failed',
+                                       'UNDELIV': 'failed', 'UNDELIVERABLE': 'failed',
+                                       'ACCEPTD': 'submitted', 'REJECTD': 'rejected'}
+                            ds = dlr_map.get(stat.upper(), 'delivered')
+                            self.db.update_dlr(mid, ds)
+                            # Forward DLR to connected client
+                            sms_data, sms_desc = self.db._fetchone(
+                                "SELECT id, client_id, sender, recipient "
+                                "FROM sms_logs WHERE message_id=%s", (mid,))
+                            if sms_data:
+                                sms = dict(zip(sms_desc, sms_data))
+                                cid = sms.get('client_id')
+                                if cid and cid in self.gateway.app.sessions:
+                                    sess = self.gateway.app.sessions[cid]
+                                    try:
+                                        await self.gateway._send_dlr_pdu(
+                                            sess._protocol,
+                                            sender_number=sms.get('sender', ''),
+                                            recipient_number=sms.get('recipient', ''),
+                                            msg_id=mid,
+                                            dlr_status=ds,
+                                        )
+                                        logger.info(f"DLR forwarded to client {cid}: {mid} -> {ds}")
+                                    except Exception as e:
+                                        logger.error(f"DLR forward to client {cid} failed: {e}")
+                                        existing_data, _ = self.db._fetchone(
+                                            "SELECT id FROM dlr_queue WHERE message_id=%s "
+                                            "AND client_id=%s AND processed=false LIMIT 1",
+                                            (mid, cid))
+                                        if not existing_data:
+                                            self.db.queue_dlr(sms.get('id'), mid, cid, sid, ds)
+                                elif cid:
+                                    existing_data, _ = self.db._fetchone(
+                                        "SELECT id FROM dlr_queue WHERE message_id=%s "
+                                        "AND client_id=%s AND processed=false LIMIT 1",
+                                        (mid, cid))
+                                    if not existing_data:
+                                        self.db.queue_dlr(sms.get('id'), mid, cid, sid, ds)
+                                    logger.info(f"DLR queued for client {cid}: {mid} -> {ds}")
+                            logger.info(f"DLR from SMSC ({listen_name}): {mid} -> {ds}")
+                    except Exception as e:
+                        logger.error(f"DLR handler ({listen_name}): {e}")
+
+                # Send enquire_link every ~15s
+                if enquire_count >= 15:
+                    try:
+                        await client.send_enquire_link()
+                        logger.debug(f"SMSC ({listen_name}): enquire_link sent")
+                    except Exception as e:
+                        logger.warning(f"SMSC ({listen_name}): enquire_link failed: {e}")
+                    enquire_count = 0
+
+            except (ConnectionError, BrokenPipeError, OSError):
+                logger.warning(f"SMSC ({listen_name}): connection lost")
+                break
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"SMSC ({listen_name}) read_once: {e}")
+                await asyncio.sleep(0.1)
+
+        # Connection lost — clean up
+        logger.info(f"SMSC ({listen_name}): listen loop ended")
+        async with self.lock:
+            self.connections.pop(sid, None)
+            self.supplier_info.pop(sid, None)
+        self.listen_tasks.pop(sid, None)
+        try:
+            self.db.set_bind_status('suppliers', sid, 'unbound',
+                                    supplier.get('system_id', ''),
+                                    f"{supplier.get('host', '')}:{supplier.get('port', '')}")
+        except:
+            pass
+
+    async def manager_worker(self):
+        """Main loop: read active SMPP suppliers from DB and manage connections."""
+        retry_counts: dict[int, int] = {}
+        while self.running:
+            try:
+                suppliers = self.db.get_active_smpp_suppliers()
+                connected_ids = set(self.connections.keys())
+                db_ids = {s['id'] for s in suppliers}
+
+                # Disconnect suppliers no longer active
+                for sid in connected_ids - db_ids:
+                    await self.disconnect_supplier(sid)
+                    retry_counts.pop(sid, None)
+
+                # Connect new or reconnecting suppliers
+                for sup in suppliers:
+                    sid = sup['id']
+                    if sid not in self.connections:
+                        prev_retries = retry_counts.get(sid, 0)
+                        if await self.connect_supplier(sup):
+                            retry_counts[sid] = 0
+                        else:
+                            retry_counts[sid] = prev_retries + 1
+                            delay = min(5 + retry_counts[sid] * 2, 30)
+                            logger.info(f"SMSC supplier {sid} ({sup['name']}): retry in {delay}s")
+
+            except Exception as e:
+                logger.error(f"Supplier manager error: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+            await asyncio.sleep(10)
+
+    async def send_via_supplier(self, supplier_id: int, sender: str,
+                                 recipient: str, message: str):
+        """Send SMS via a specific supplier connection."""
+        client = self.connections.get(supplier_id)
+        if not client or not client.connected:
+            logger.warning(f"SMSC supplier {supplier_id} not connected")
+            return False, None
+        try:
+            return await client.send_submit_sm(sender, recipient, message)
+        except Exception as e:
+            logger.error(f"SMSC send via supplier {supplier_id}: {e}")
+            return False, None
+
+    def get_status_list(self):
+        """Get status of all supplier connections."""
+        result = []
+        for sid, client in self.connections.items():
+            info = self.supplier_info.get(sid, {})
+            result.append({
+                'supplier_id': sid,
+                'name': info.get('name', ''),
+                'system_id': info.get('system_id', ''),
+                'host': client.host,
+                'port': client.port,
+                'connected': client.connected and bool(client.writer),
+            })
+        return result
+
+    def get_connected_count(self):
+        return sum(1 for c in self.connections.values() if c.connected)
+
+    async def shutdown(self):
+        self.running = False
+        for sid in list(self.connections.keys()):
+            await self.disconnect_supplier(sid)
 
 
 # ─── ESMC server using smppy.Application ───
@@ -457,14 +937,45 @@ class Net2AppSmppApplication(Application):
         self.sessions: dict[int, SmppClient] = {}
 
     async def handle_bound_client(self, client: SmppClient) -> Optional[SmppClient]:
-        """Authenticate ESME client against DB."""
+        """Authenticate ESME client against DB and check IP whitelist."""
         try:
             db_client = self.db.auth_client(client.system_id, client.password)
             if db_client:
-                logger.info(f"✓ {client.system_id} authenticated as '{db_client['name']}'")
+                # Get client's IP address
+                remote_addr = ''
+                try:
+                    peername = client._protocol._transport.get_extra_info('peername')
+                    if peername:
+                        remote_addr = str(peername[0]) if isinstance(peername, tuple) else str(peername)
+                except Exception:
+                    pass
+
+                # Check/auto-set IP whitelist
+                allowed = db_client.get('allowed_ips', '') or ''
+                client_smpp_host = db_client.get('smpp_host', '') or ''
+
+                if allowed:
+                    # Manual whitelist set — check against it
+                    if not self.db.check_ip_allowed(allowed, remote_addr):
+                        logger.warning(f"✗ Bind rejected: {client.system_id} from {remote_addr} "
+                                       f"(not in allowed_ips: {allowed})")
+                        return None
+                elif client_smpp_host:
+                    # No manual whitelist but smpp_host is set — auto-whitelist the connecting IP
+                    # This saves the IP so future connections from the same IP are allowed
+                    now_allowed = remote_addr
+                    self.db._execute(
+                        "UPDATE clients SET allowed_ips=%s, updated_at=NOW() WHERE id=%s AND "
+                        "(allowed_ips IS NULL OR allowed_ips='')",
+                        (now_allowed, db_client['id']))
+                    logger.info(f"✓ Auto-whitelisted {client.system_id} from {remote_addr}")
+                # else: no whitelist, no smpp_host — allow all
+
+                logger.info(f"✓ {client.system_id} authenticated as '{db_client['name']}' "
+                           f"from {remote_addr}")
                 self.sessions[db_client['id']] = client
                 self.db.set_bind_status('clients', db_client['id'], 'bound',
-                                        client.system_id, '')
+                                        client.system_id, remote_addr)
                 return client
             else:
                 logger.warning(f"✗ Bind failed: {client.system_id} (invalid credentials)")
@@ -483,20 +994,54 @@ class Net2AppSmppApplication(Application):
                 break
 
     async def handle_sms_received(self, client: SmppClient, source_number: str,
-                                  dest_number: str, text: str):
-        """Process incoming submit_sm from ESME client."""
+                                  dest_number: str, text: str,
+                                  pre_generated_msg_id: Optional[str] = None):
+        """Process incoming submit_sm from ESME client.
+        
+        Args:
+            pre_generated_msg_id: If provided, use this instead of generating a new one.
+                This is used when the protocol layer already sent submit_sm_resp with
+                this message_id so the client can match the DLR.
+        """
         try:
-            # Find client_id from session
+            # Find client_id from session (try object identity first, then system_id)
             client_id = None
+            sysid = getattr(client, 'system_id', None)
             for cid, sess in self.sessions.items():
                 if sess is client:
                     client_id = cid
                     break
+            if client_id is None and sysid:
+                for cid, sess in self.sessions.items():
+                    if getattr(sess, 'system_id', None) == sysid:
+                        client_id = cid
+                        break
+
             if client_id is None:
-                logger.warning("SMS from unknown client session")
+                logger.warning(f"SMS from unknown client session (system_id={sysid})")
+                # Still log the SMS with failed status so it's not lost
+                msg_id = pre_generated_msg_id or self.gateway.gen_msg_id()
+                mcc_mnc = self.gateway.get_mcc_mnc(dest_number)
+                ld = {
+                    'message_id': msg_id, 'client_id': None,
+                    'client_user': sysid or 'unknown', 'client_alias': '',
+                    'supplier_id': None, 'supplier_user': '',
+                    'route_id': None, 'route_name': '',
+                    'trunk_id': None, 'channel': '', 'device': '',
+                    'sender': source_number, 'recipient': dest_number, 'message_text': text,
+                    'parts': max(1, (len(text) + 152) // 153),
+                    'status': 'failed',
+                    'mcc': mcc_mnc[:3], 'mnc': mcc_mnc[3:],
+                    'in_msg_id': str(msg_id), 'out_msg_id': msg_id, 'supplier_msg_id': msg_id,
+                    'client_rate': 0, 'supplier_rate': 0,
+                    'cost': 0, 'pay': 0, 'profit': 0,
+                    'ip_address': '',
+                }
+                self.db.log_sms(ld)
+                logger.info(f"Failed SMS logged: {msg_id} (unknown session)")
                 return
 
-            logger.info(f"SUBMIT_SM: {source_number} -> {dest_number} '{text[:50]}'")
+            logger.info(f"SUBMIT_SM: {source_number} -> {dest_number} '{text[:50]}' (client={client_id}, sysid={sysid})")
 
             mcc_mnc = self.gateway.get_mcc_mnc(dest_number)
             route = self.db.get_route(client_id, mcc_mnc)
@@ -507,7 +1052,7 @@ class Net2AppSmppApplication(Application):
                 parts = max(1, (len(text) + 152) // 153)
                 cost = sr * parts
                 pay = cr * parts
-                msg_id = self.gateway.gen_msg_id()
+                msg_id = pre_generated_msg_id or self.gateway.gen_msg_id()
 
                 if cr > 0 and sr > 0 and cr > sr:
                     self.db.deduct_balance('clients', client_id, pay)
@@ -515,7 +1060,7 @@ class Net2AppSmppApplication(Application):
 
                     ld = {
                         'message_id': msg_id, 'client_id': client_id,
-                        'client_user': client.system_id, 'client_alias': '',
+                        'client_user': sysid or '', 'client_alias': '',
                         'supplier_id': route['supplier_id'],
                         'supplier_user': route.get('supplier_name', ''),
                         'route_id': route['route_id'], 'route_name': route.get('route_name', ''),
@@ -532,10 +1077,8 @@ class Net2AppSmppApplication(Application):
                     log_id = self.db.log_sms(ld)
                     logger.info(f"SMS logged: {msg_id} (ID={log_id})")
 
-                    # Forward to supplier
-                    loop = asyncio.get_event_loop()
-                    fwd_ok, sup_msg_id = await loop.run_in_executor(
-                        self.gateway.executor, self.gateway.forward_to_supplier_sync,
+                    # Forward to supplier (async SMSC or executor for HTTP)
+                    fwd_ok, sup_msg_id = await self.gateway.forward_to_supplier_async(
                         source_number, dest_number, text, route)
 
                     if fwd_ok:
@@ -551,26 +1094,92 @@ class Net2AppSmppApplication(Application):
                             (msg_id,))
                         logger.warning(f"✗ Failed to forward: {msg_id}")
 
-                    # Send DLR (deliver_sm) if registered delivery requested
-                    # smppy auto-acks submit_sm; we send DLR for actual delivery result
+                    # Queue DLR for delivery to client (via _dlr_consumer)
                     if fwd_ok:
                         self.db.queue_dlr(log_id, msg_id, client_id, route['supplier_id'], 'delivered')
                         self.db.update_dlr(msg_id, 'delivered')
+                        # Apply force DLR timeout delay before sending DLR to client
                         try:
-                            await client.send_sms(
-                                source=route.get('supplier_name', 'SMSC'),
-                                dest=source_number,
-                                text=f"id:{msg_id} sub:001 dlvrd:001 submit date:{datetime.now().strftime('%y%m%d%H%M')} done date:{datetime.now().strftime('%y%m%d%H%M')} stat:DELIVRD err:000 text:{text[:20]}"
+                            tout_row, _ = self.db._fetchone(
+                                "SELECT force_dlr_timeout FROM clients WHERE id=%s", (client_id,))
+                            timeout_str = tout_row[0] if tout_row else '0'
+                            if timeout_str == 'random':
+                                dlr_delay = random.uniform(0, 5)
+                            else:
+                                try:
+                                    dlr_delay = float(timeout_str)
+                                except (ValueError, TypeError):
+                                    dlr_delay = 0.0
+                            if dlr_delay > 0:
+                                logger.info(f"DLR timeout: waiting {dlr_delay:.1f}s for {msg_id}")
+                                await asyncio.sleep(dlr_delay)
+                        except Exception as e:
+                            logger.warning(f"DLR timeout lookup failed: {e}")
+                        # Attempt immediate DLR send with proper esm_class=SMSC_DELIVERY_RECEIPT
+                        try:
+                            dlr_ok = await self.gateway._send_dlr_pdu(
+                                client._protocol,
+                                sender_number=source_number,
+                                recipient_number=dest_number,
+                                msg_id=msg_id,
+                                dlr_status='delivered',
                             )
-                            logger.info(f"DLR sent to {client.system_id} for {msg_id}")
+                            if dlr_ok:
+                                self.db._execute(
+                                    "UPDATE dlr_queue SET processed=true, processed_at=NOW() "
+                                    "WHERE message_id=%s AND client_id=%s AND processed=false",
+                                    (msg_id, client_id))
+                                logger.info(f"DLR sent to {sysid} for {msg_id}")
+                            else:
+                                logger.warning(f"DLR immediate send failed for {msg_id}, will retry via consumer")
                         except Exception as e:
                             logger.error(f"DLR send failed: {e}")
                 else:
                     logger.warning(f"Rate validation failed: cr={cr} sr={sr}")
+                    # Log failed SMS for rate issues too
+                    ld = {
+                        'message_id': msg_id, 'client_id': client_id,
+                        'client_user': sysid or '', 'client_alias': '',
+                        'supplier_id': route.get('supplier_id'),
+                        'supplier_user': route.get('supplier_name', ''),
+                        'route_id': route['route_id'], 'route_name': route.get('route_name', ''),
+                        'trunk_id': route['trunk_id'], 'channel': route.get('trunk_name', ''),
+                        'device': route.get('trunk_name', ''),
+                        'sender': source_number, 'recipient': dest_number, 'message_text': text,
+                        'parts': parts, 'status': 'failed',
+                        'mcc': mcc_mnc[:3], 'mnc': mcc_mnc[3:],
+                        'in_msg_id': str(msg_id), 'out_msg_id': msg_id, 'supplier_msg_id': msg_id,
+                        'client_rate': cr, 'supplier_rate': sr,
+                        'cost': 0, 'pay': 0, 'profit': 0,
+                        'ip_address': '',
+                    }
+                    self.db.log_sms(ld)
+                    logger.info(f"Failed SMS logged: {msg_id} (rate validation)")
             else:
-                logger.warning(f"No route for client {client_id}")
+                logger.warning(f"No route for client {client_id} (mcc_mnc={mcc_mnc})")
+                # Log failed SMS for missing route
+                msg_id = pre_generated_msg_id or self.gateway.gen_msg_id()
+                ld = {
+                    'message_id': msg_id, 'client_id': client_id,
+                    'client_user': sysid or '', 'client_alias': '',
+                    'supplier_id': None, 'supplier_user': '',
+                    'route_id': None, 'route_name': '',
+                    'trunk_id': None, 'channel': '', 'device': '',
+                    'sender': source_number, 'recipient': dest_number, 'message_text': text,
+                    'parts': max(1, (len(text) + 152) // 153),
+                    'status': 'failed',
+                    'mcc': mcc_mnc[:3], 'mnc': mcc_mnc[3:],
+                    'in_msg_id': str(msg_id), 'out_msg_id': msg_id, 'supplier_msg_id': msg_id,
+                    'client_rate': 0, 'supplier_rate': 0,
+                    'cost': 0, 'pay': 0, 'profit': 0,
+                    'ip_address': '',
+                }
+                self.db.log_sms(ld)
+                logger.info(f"Failed SMS logged: {msg_id} (no route)")
         except Exception as e:
             logger.error(f"handle_sms_received error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
 
 class SmppGatewayServer:
@@ -579,18 +1188,18 @@ class SmppGatewayServer:
     def __init__(self):
         self.db = DatabaseBridge()
         self.running = True
-        self.supplier_client: Optional[SmppSupplierClient] = None
-        self.supplier_connected = False
-        self.supplier_stop = Event()
-        self.supplier_lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.supplier_stop = asyncio.Event()
+        self.executor = ThreadPoolExecutor(max_workers=4)
         self.loop = None
+        self.supplier_manager: Optional[SmppSupplierManager] = None
         self.app = Net2AppSmppApplication(self)
 
     def gen_msg_id(self):
         return f"N2A{datetime.now().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
 
     def get_mcc_mnc(self, num):
+        if isinstance(num, bytes):
+            num = num.decode('utf-8', errors='replace')
         c = num.lstrip('+').lstrip('00')
         for prefix, mccmnc in [('880', '47001'), ('91', '40468'), ('251', '63601'),
                                ('1', '310410'), ('44', '23430'), ('92', '41001')]:
@@ -598,127 +1207,70 @@ class SmppGatewayServer:
                 return mccmnc
         return '47001'
 
-    def _smsc_worker(self):
-        """SMSC supplier connection thread using SmppSupplierClient."""
-        retry_count = 0
-        while self.running and not self.supplier_stop.is_set():
-            try:
-                logger.info(f"SMSC: connecting to {SMPP_CONFIG['supplier_host']}:{SMPP_CONFIG['supplier_port']} (attempt #{retry_count + 1})")
-
-                client = SmppSupplierClient(
-                    SMPP_CONFIG['supplier_host'],
-                    SMPP_CONFIG['supplier_port'],
-                    SMPP_CONFIG['supplier_system_id'],
-                    SMPP_CONFIG['supplier_password'],
-                )
-
-                if client.connect_and_bind():
-                    with self.supplier_lock:
-                        self.supplier_client = client
-                        self.supplier_connected = True
-                    retry_count = 0
-
-                    # Update DB
-                    try:
-                        loop = asyncio.run_coroutine_threadsafe(
-                            self._update_supplier_bind('bound'), self.loop)
-                        loop.result(timeout=5)
-                    except:
-                        pass
-
-                    # Listen loop with keepalive
-                    enquire_count = 0
-                    while self.running and not self.supplier_stop.is_set():
-                        try:
-                            pdu = client.read_once()
-                            if pdu is None:
-                                enquire_count += 1
-                            else:
-                                enquire_count = 0
-                                # Handle DLR from SMSC
-                                if pdu.command_id == CommandId.deliver_sm:
-                                    try:
-                                        # message_id and stat can be direct attributes or in params
-                                        mid = getattr(pdu, 'message_id', None)
-                                        if mid is None and hasattr(pdu, 'params'):
-                                            mid = pdu.params.get('message_id', b'')
-                                        if mid is None:
-                                            mid = b''
-                                        stat = getattr(pdu, 'stat', None)
-                                        if stat is None and hasattr(pdu, 'params'):
-                                            stat = pdu.params.get('stat', b'')
-                                        if stat is None:
-                                            stat = b''
-                                        if isinstance(mid, bytes):
-                                            mid = mid.decode('utf-8', errors='replace')
-                                        if isinstance(stat, bytes):
-                                            stat = stat.decode('utf-8', errors='replace')
-                                        if mid:
-                                            dlr_map = {'DELIVRD': 'delivered', 'DELIVERED': 'delivered',
-                                                       'EXPIRED': 'expired', 'DELETED': 'failed',
-                                                       'UNDELIV': 'failed', 'UNDELIVERABLE': 'failed',
-                                                       'ACCEPTD': 'submitted', 'REJECTD': 'rejected'}
-                                            ds = dlr_map.get(stat.upper(), 'delivered')
-                                            self.db.update_dlr(mid, ds)
-                                            logger.info(f"DLR from SMSC: {mid} -> {ds}")
-                                    except Exception as e:
-                                        logger.error(f"DLR handler: {e}")
-
-                            # Send enquire_link every ~15s
-                            if enquire_count >= 15:
-                                try:
-                                    client.send_enquire_link()
-                                    logger.debug("Enquire_link sent to SMSC")
-                                except:
-                                    pass
-                                enquire_count = 0
-
-                        except (ConnectionError, BrokenPipeError, OSError):
-                            logger.warning("SMSC connection lost")
-                            break
-                        except Exception as e:
-                            logger.debug(f"SMSC read_once: {e}")
-                            time.sleep(0.1)
-
-                    client.close()
-                else:
-                    client.close()
-
-            except Exception as e:
-                logger.error(f"SMSC connection failed (attempt #{retry_count + 1}): {e}")
-                with self.supplier_lock:
-                    self.supplier_connected = False
-                try:
-                    coro = self._update_supplier_bind('unbound')
-                    fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
-                    fut.result(timeout=5)
-                except:
-                    pass
-
-            with self.supplier_lock:
-                self.supplier_client = None
-
-            retry_count += 1
-            if self.running and not self.supplier_stop.is_set():
-                delay = min(5 + retry_count * 2, 30)
-                logger.info(f"SMSC reconnect in {delay}s (retry #{retry_count})")
-                self.supplier_stop.wait(delay)
-
-    async def _update_supplier_bind(self, status):
-        self.db.set_bind_status('suppliers', 2, status, SMPP_CONFIG['supplier_system_id'],
-                               f"{SMPP_CONFIG['supplier_host']}:{SMPP_CONFIG['supplier_port']}")
-
-    def send_via_smsc_sync(self, sender, recipient, message):
-        """Send via SMSC supplier."""
-        with self.supplier_lock:
-            if not self.supplier_connected or not self.supplier_client:
-                return False, None
-            client = self.supplier_client
+    async def _send_dlr_pdu(self, protocol, sender_number, recipient_number, msg_id, dlr_status):
+        """Send a proper DLR deliver_sm PDU with correct esm_class=SMSC_DELIVERY_RECEIPT.
+        
+        Bypasses smppy's client.send_sms() / send_deliver_sm because that method
+        hardcodes EsmClassType.DEFAULT (0) instead of EsmClassType.SMSC_DELIVERY_RECEIPT (0x04).
+        Without the correct esm_class bit set, SMPP clients will not recognize the
+        incoming message as a delivery receipt.
+        
+        Args:
+            protocol: SmppProtocol instance of the connected client
+            sender_number: original source number from submit_sm (DLR destination)
+            recipient_number: original destination number from submit_sm (DLR source)
+            msg_id: internal message ID
+            dlr_status: delivery status string
+        """
         try:
-            return client.send_submit_sm(sender, recipient, message)
+            status_map = {
+                'delivered': 'DELIVRD', 'failed': 'UNDELIV',
+                'submitted': 'ACCEPTD', 'expired': 'EXPIRED', 'rejected': 'REJECTD',
+            }
+            smpp_stat = status_map.get(dlr_status or 'delivered', 'DELIVRD')
+
+            dlr_text = (
+                f"id:{msg_id} sub:001 dlvrd:001 "
+                f"submit date:{datetime.now().strftime('%y%m%d%H%M')} "
+                f"done date:{datetime.now().strftime('%y%m%d%H%M')} "
+                f"stat:{smpp_stat} err:000"
+            )
+            msg_bytes = dlr_text.encode('ascii')
+
+            pdu = DeliverSM(
+                sequence_number=protocol.next_sequence_number(),
+                service_type='',
+                source_addr_ton=AddrTon.INTERNATIONAL,
+                source_addr_npi=AddrNpi.ISDN,
+                source_addr=recipient_number,
+                dest_addr_ton=AddrTon.INTERNATIONAL,
+                dest_addr_npi=AddrNpi.ISDN,
+                destination_addr=sender_number,
+                esm_class=EsmClass(EsmClassMode.DEFAULT, EsmClassType.SMSC_DELIVERY_RECEIPT),
+                protocol_id=0,
+                priority_flag=PriorityFlag.LEVEL_0,
+                registered_delivery=RegisteredDelivery(
+                    RegisteredDeliveryReceipt.NO_SMSC_DELIVERY_RECEIPT_REQUESTED),
+                replace_if_present_flag=ReplaceIfPresentFlag.DO_NOT_REPLACE,
+                data_coding=DataCoding(scheme_data=DataCodingDefault.SMSC_DEFAULT_ALPHABET),
+                short_message=msg_bytes,
+            )
+            protocol._send_PDU(pdu)
+            logger.info(f"DLR sent: {msg_id} -> {smpp_stat} (src={recipient_number}, dst={sender_number})")
+            return True
         except Exception as e:
-            logger.error(f"SMSC send: {e}")
+            logger.error(f"_send_dlr_pdu failed: {e}")
+            return False
+
+
+
+    async def send_via_smsc_async(self, sender, recipient, message, supplier_id):
+        """Send via SMSC supplier using the dynamic supplier manager."""
+        if not self.supplier_manager:
+            logger.error("Supplier manager not initialized")
             return False, None
+        return await self.supplier_manager.send_via_supplier(
+            supplier_id, sender, recipient, message)
 
     def send_via_http_api_sync(self, sender, recipient, message, route):
         """Send via HTTP API supplier (e.g. SMS Sheba)."""
@@ -802,23 +1354,34 @@ class SmppGatewayServer:
             logger.error(f"HTTP API send error: {e}")
             return False, None
 
-    def forward_to_supplier_sync(self, sender, recipient, message, route):
-        """Forward SMS to the appropriate supplier."""
+    async def forward_to_supplier_async(self, sender, recipient, message, route):
+        """Forward SMS to the appropriate supplier (async for SMSC, executor for HTTP)."""
         conn_type = route.get('supplier_conn_type', 'smpp')
+        supplier_id = route.get('supplier_id')
+        if not supplier_id:
+            logger.error("No supplier_id in route")
+            return False, None
         if conn_type == 'http':
-            return self.send_via_http_api_sync(sender, recipient, message, route)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.executor, self.send_via_http_api_sync,
+                sender, recipient, message, route)
         else:
-            return self.send_via_smsc_sync(sender, recipient, message)
+            return await self.send_via_smsc_async(
+                sender, recipient, message, supplier_id)
 
     async def http_api(self):
         """HTTP REST API bridge on port 9000."""
         from aiohttp import web
 
         async def status(req):
+            supplier_list = []
+            if self.supplier_manager:
+                supplier_list = self.supplier_manager.get_status_list()
             return web.json_response({
-                'server': 'running', 'esmc_port': SMPP_CONFIG['server_port'],
-                'supplier_connected': self.supplier_connected,
-                'supplier': f"{SMPP_CONFIG['supplier_host']}:{SMPP_CONFIG['supplier_port']}",
+                'server': 'running',
+                'esmc_host': ESMC_HOST,
+                'esmc_port': ESMC_PORT,
                 'sessions': len(self.app.sessions),
                 'session_list': [
                     {'client_id': cid, 'system_id': s.system_id,
@@ -827,6 +1390,8 @@ class SmppGatewayServer:
                         and hasattr(s._protocol._transport, 'get_extra_info') else ''}
                     for cid, s in self.app.sessions.items()
                 ],
+                'suppliers_connected': len(supplier_list),
+                'suppliers': supplier_list,
             })
 
         async def send(req):
@@ -857,9 +1422,7 @@ class SmppGatewayServer:
                     self.db.deduct_balance('clients', client_id, pay)
                     self.db.deduct_balance('suppliers', route['supplier_id'], cost)
 
-                    loop = asyncio.get_event_loop()
-                    fwd_ok, sup_msg_id = await loop.run_in_executor(
-                        self.executor, self.forward_to_supplier_sync,
+                    fwd_ok, sup_msg_id = await self.forward_to_supplier_async(
                         sender, recipient, message, route)
 
                 ld = {
@@ -895,10 +1458,62 @@ class SmppGatewayServer:
             except Exception as e:
                 return web.json_response({'error': str(e)}, status=400)
 
+        async def rebind(req):
+            """Force rebind a client or supplier session.
+            Body: { entity_type: "client"|"supplier", entity_id: number }
+            For clients: force-disconnects their SMPP session
+            For suppliers: disconnects and reconnects via supplier manager
+            """
+            try:
+                data = await req.json()
+                entity_type = data.get('entity_type', '')
+                entity_id = int(data.get('entity_id', 0))
+                if not entity_type or not entity_id:
+                    return web.json_response({'error': 'entity_type and entity_id required'}, status=400)
+
+                if entity_type == 'client':
+                    # Force disconnect the client session
+                    sess = self.app.sessions.pop(entity_id, None)
+                    if sess:
+                        try:
+                            sess._protocol._transport.close()
+                        except Exception:
+                            pass
+                        self.db.set_bind_status('clients', entity_id, 'unbound',
+                                                sess.system_id, '')
+                        logger.info(f"Rebind: force-disconnected client {entity_id} ({sess.system_id})")
+                        return web.json_response({
+                            'success': True,
+                            'message': f'Client {sess.system_id} disconnected. They will auto-reconnect.'
+                        })
+                    else:
+                        return web.json_response({
+                            'success': True,
+                            'message': 'Client was not connected'
+                        })
+
+                elif entity_type == 'supplier':
+                    if not self.supplier_manager:
+                        return web.json_response({'error': 'Supplier manager not initialized'}, status=500)
+                    # Force disconnect and reconnect
+                    await self.supplier_manager.disconnect_supplier(entity_id)
+                    logger.info(f"Rebind: force-disconnected supplier {entity_id}")
+                    return web.json_response({
+                        'success': True,
+                        'message': f'Supplier {entity_id} disconnected. Manager will auto-reconnect.'
+                    })
+
+                return web.json_response({'error': 'Invalid entity_type'}, status=400)
+
+            except Exception as e:
+                logger.error(f"Rebind error: {e}")
+                return web.json_response({'error': str(e)}, status=500)
+
         app = web.Application()
         app.router.add_get('/api/smpp/status', status)
         app.router.add_post('/api/smpp/send', send)
         app.router.add_post('/api/smpp/dlr', dlr)
+        app.router.add_post('/api/smpp/rebind', rebind)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '127.0.0.1', 9000)
@@ -939,28 +1554,80 @@ class SmppGatewayServer:
             except Exception as e:
                 logger.error(f"ESMC keepalive error: {e}")
 
+    async def _dlr_consumer(self):
+        """Background task: process dlr_queue and send DLRs to SMPP clients."""
+        while self.running:
+            try:
+                await asyncio.sleep(5)
+                # Fetch unprocessed DLR entries with sender and recipient from sms_logs
+                rows = self.db._fetchall(
+                    "SELECT dq.id, dq.sms_log_id, dq.message_id, dq.client_id, dq.dlr_status, "
+                    "COALESCE(sl.sender, '') as source_number, "
+                    "COALESCE(sl.recipient, '') as dest_number "
+                    "FROM dlr_queue dq "
+                    "LEFT JOIN sms_logs sl ON sl.id = dq.sms_log_id "
+                    "WHERE dq.processed=false AND dq.direction='supplier_to_client' "
+                    "ORDER BY dq.id ASC LIMIT 50")
+                if not rows:
+                    continue
+                for row in rows:
+                    dq_id, sms_log_id, msg_id, client_id, dlr_status, source_number, dest_number = row
+                    if client_id is None:
+                        self.db._execute("UPDATE dlr_queue SET processed=true, processed_at=NOW() WHERE id=%s", (dq_id,))
+                        continue
+                    # Find SMPP client session
+                    sess = self.app.sessions.get(client_id)
+                    if sess is None:
+                        continue  # Client not connected, will retry
+                    # Send DLR via direct DeliverSM PDU with correct esm_class=SMSC_DELIVERY_RECEIPT
+                    try:
+                        dlr_ok = await self._send_dlr_pdu(
+                            sess._protocol,
+                            sender_number=source_number,
+                            recipient_number=dest_number,
+                            msg_id=msg_id,
+                            dlr_status=dlr_status or 'delivered',
+                        )
+                        if dlr_ok:
+                            self.db._execute(
+                                "UPDATE dlr_queue SET processed=true, processed_at=NOW() WHERE id=%s", (dq_id,))
+                            logger.info(f"DLR consumer: sent DLR to client {client_id} for {msg_id} ({dlr_status})")
+                        else:
+                            self.db._execute(
+                                "UPDATE dlr_queue SET retry_count=COALESCE(retry_count,0)+1 WHERE id=%s", (dq_id,))
+                    except Exception as e:
+                        logger.warning(f"DLR consumer: failed to send DLR to client {client_id}: {e}")
+                        self.db._execute(
+                            "UPDATE dlr_queue SET retry_count=COALESCE(retry_count,0)+1 WHERE id=%s", (dq_id,))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"DLR consumer error: {e}")
+
     async def run(self):
         """Start all components."""
         self.loop = asyncio.get_event_loop()
 
+        # Initialize supplier manager for dynamic SMSC connections
+        self.supplier_manager = SmppSupplierManager(self)
+
         logger.info("╔══════════════════════════════════════════════╗")
         logger.info("║   Net2App Blast SMPP Gateway Server v3     ║")
         logger.info("╠══════════════════════════════════════════════╣")
-        logger.info(f"║  ESMC:  {SMPP_CONFIG['server_host']}:{SMPP_CONFIG['server_port']} (smppy)       ║")
-        logger.info(f"║  SMSC:  {SMPP_CONFIG['supplier_host']}:{SMPP_CONFIG['supplier_port']} (smpp.pdu) ║")
+        logger.info(f"║  ESMC:  {ESMC_HOST}:{ESMC_PORT} (smppy)                     ║")
         logger.info(f"║  REST:  http://127.0.0.1:9000              ║")
+        logger.info(f"║  SMSC:  Dynamic (from DB)          ║")
         logger.info("╚══════════════════════════════════════════════╝")
-
-        # Start SMSC worker thread
-        smsc_thread = Thread(target=self._smsc_worker, daemon=True)
-        smsc_thread.start()
 
         tasks = [
             asyncio.create_task(self.http_api()),
             asyncio.create_task(self._esmc_keepalive()),
+            asyncio.create_task(self._dlr_consumer()),
+            asyncio.create_task(self.supplier_manager.manager_worker()),
         ]
 
         # Start ESMC server using a custom protocol that cleans up on disconnect
+        # and sends submit_sm_resp with message_id for DLR correlation
         class Net2AppSmppProtocol(SmppProtocol):
             def connection_lost(self, exc):
                 if self._client:
@@ -980,12 +1647,64 @@ class SmppGatewayServer:
                     return  # Silent handling
                 await super().request_handler(pdu)
 
+            async def handle_data_received(self, data: bytes):
+                """Override to include message_id in submit_sm_resp.
+                This allows clients to correlate DLRs with their original submit_sm."""
+                file = io.BytesIO(data)
+                pdu = PDUEncoder().decode(file)
+
+                if pdu.command_id == CommandId.submit_sm:
+                    submit_sm = SubmitSM(sequence_number=pdu.sequence_number, **pdu.params)
+                    sms = SMStringEncoder().decode_SM(submit_sm).str
+
+                    # Generate message ID BEFORE responding so we can include it
+                    # in submit_sm_resp. The client receives this ID and can later
+                    # match it with the DLR text (id:N2A...).
+                    msg_id = self.app.gateway.gen_msg_id()
+
+                    # Send submit_sm_resp WITH message_id
+                    resp = SubmitSMResp(
+                        sequence_number=submit_sm.sequence_number,
+                        message_id=msg_id,
+                        status=CommandStatus.ESME_ROK,
+                    )
+                    self._send_response(resp)
+
+                    # Handle concatenated messages
+                    while (submit_sm.params.get('more_messages_to_send') ==
+                           MoreMessagesToSend.MORE_MESSAGES):
+                        pdu = PDUEncoder().decode(file)
+                        if pdu.command_id != CommandId.submit_sm:
+                            self.app.logger.error(
+                                f'Expected submit_sm, got {pdu.command_id}')
+                            break
+                        submit_sm = SubmitSM(
+                            sequence_number=pdu.sequence_number, **pdu.params)
+                        sms += SMStringEncoder().decode_SM(submit_sm).str
+                        resp = SubmitSMResp(
+                            sequence_number=submit_sm.sequence_number,
+                            message_id=msg_id,
+                            status=CommandStatus.ESME_ROK,
+                        )
+                        self._send_response(resp)
+
+                    # Call handler with pre-generated msg_id
+                    await self.app.handle_sms_received(
+                        client=self._client,
+                        source_number=submit_sm.params['source_addr'],
+                        dest_number=submit_sm.params['destination_addr'],
+                        text=sms,
+                        pre_generated_msg_id=msg_id,
+                    )
+                else:
+                    await super().handle_data_received(data)
+
         factory = lambda: Net2AppSmppProtocol(app=self.app)
-        esmc_server = await self.loop.create_server(factory, host=SMPP_CONFIG['server_host'],
-                                                    port=SMPP_CONFIG['server_port'])
+        esmc_server = await self.loop.create_server(factory, host=ESMC_HOST,
+                                                    port=ESMC_PORT)
 
         async def serve_esmc():
-            logger.info(f"ESMC listening on {SMPP_CONFIG['server_host']}:{SMPP_CONFIG['server_port']} (smppy)")
+            logger.info(f"ESMC listening on {ESMC_HOST}:{ESMC_PORT} (smppy)")
             async with esmc_server:
                 await esmc_server.serve_forever()
 
@@ -997,8 +1716,8 @@ class SmppGatewayServer:
         finally:
             self.running = False
             self.supplier_stop.set()
-            if smsc_thread.is_alive():
-                smsc_thread.join(timeout=5)
+            if self.supplier_manager:
+                await self.supplier_manager.shutdown()
 
 
 def main():
@@ -1007,7 +1726,6 @@ def main():
     def shutdown(sig, frame):
         logger.info(f"Signal {sig}, shutting down...")
         server.running = False
-        server.supplier_stop.set()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)

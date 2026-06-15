@@ -2,14 +2,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { smtpConfig } from "@/db/schema";
 import { desc, eq } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET() {
   try {
     const result = await db.select().from(smtpConfig).orderBy(desc(smtpConfig.createdAt)).limit(1);
     return NextResponse.json(result[0] || null);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -31,7 +31,6 @@ export async function POST(req: NextRequest) {
     }).returning();
     return NextResponse.json(created, { status: 201 });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

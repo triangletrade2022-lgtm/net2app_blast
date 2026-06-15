@@ -93,6 +93,7 @@ export const clients = pgTable("clients", {
   smppPassword: varchar("smpp_password", { length: 100 }),
   smppHost: varchar("smpp_host", { length: 255 }),
   smppPort: integer("smpp_port").default(2775),
+  smppTls: boolean("smpp_tls").default(false),
   smppBindType: varchar("smpp_bind_type", { length: 50 }).default("transceiver"),
   smppTps: integer("smpp_tps").default(10),
   // HTTP settings
@@ -103,6 +104,7 @@ export const clients = pgTable("clients", {
   dlrEnabled: boolean("dlr_enabled").default(true),
   forceDlr: boolean("force_dlr").notNull().default(false),
   forceDlrStatus: varchar("force_dlr_status", { length: 50 }).default("delivered"),
+  forceDlrTimeout: varchar("force_dlr_timeout", { length: 20 }).default("0"),
   dlrCallbackUrl: varchar("dlr_callback_url", { length: 500 }),
   // Billing
   billingType: billingTypeEnum("billing_type").default("on_submit"),
@@ -131,6 +133,7 @@ export const suppliers = pgTable("suppliers", {
   smppPassword: varchar("smpp_password", { length: 100 }),
   smppHost: varchar("smpp_host", { length: 255 }),
   smppPort: integer("smpp_port").default(2775),
+  smppTls: boolean("smpp_tls").default(false),
   smppBindType: varchar("smpp_bind_type", { length: 50 }).default("transceiver"),
   smppTps: integer("smpp_tps").default(100),
   // HTTP API settings

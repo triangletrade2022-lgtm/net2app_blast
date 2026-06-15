@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { smsLogs, clients, suppliers, routes, routeTrunks, trunks, clientRates, supplierRates, license, operators } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { generateMessageId, calculateSmsParts } from "@/lib/helpers";
+import { handleApiError } from "@/lib/api-error";
 import {
   isStatusCodeDelivered,
   getSupplierStatusDescription,
@@ -270,6 +271,6 @@ export async function POST(req: NextRequest) {
       clientBalanceAfter: client.billingType === "on_submit" ? { balance: clientBalance - Math.min(clientBalance, pay), credit: Math.max(0, clientCredit - Math.max(0, pay - clientBalance)) } : null,
     });
   } catch (e: unknown) {
-    return NextResponse.json({ error: e instanceof Error ? e.message : "Unknown error" }, { status: 500 });
+    return handleApiError(e);
   }
 }

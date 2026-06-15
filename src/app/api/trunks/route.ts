@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { trunks, suppliers } from "@/db/schema";
 import { desc, eq } from "drizzle-orm";
 import { generateCode } from "@/lib/helpers";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET() {
   try {
@@ -26,8 +27,7 @@ export async function GET() {
       .orderBy(desc(trunks.createdAt));
     return NextResponse.json(result);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -48,7 +48,6 @@ export async function POST(req: NextRequest) {
     }).returning();
     return NextResponse.json(created, { status: 201 });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

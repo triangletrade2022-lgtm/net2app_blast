@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { trunks } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -10,8 +11,7 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     if (!trunk) return NextResponse.json({ error: "Not found" }, { status: 404 });
     return NextResponse.json(trunk);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -33,8 +33,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     }).where(eq(trunks.id, parseInt(id))).returning();
     return NextResponse.json(updated);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -44,7 +43,6 @@ export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ 
     await db.delete(trunks).where(eq(trunks.id, parseInt(id)));
     return NextResponse.json({ success: true });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

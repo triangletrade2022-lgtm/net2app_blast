@@ -3,14 +3,14 @@ import { db } from "@/db";
 import { clients } from "@/db/schema";
 import { generateApiKey } from "@/lib/helpers";
 import { desc } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET() {
   try {
     const result = await db.select().from(clients).orderBy(desc(clients.createdAt));
     return NextResponse.json(result);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
 
@@ -30,13 +30,13 @@ export async function POST(req: NextRequest) {
       apiKey: body.apiKey || generateApiKey(),
       forceDlr: body.forceDlr || false,
       forceDlrStatus: body.forceDlrStatus || "delivered",
+      forceDlrTimeout: body.forceDlrTimeout || "0",
       dlrCallbackUrl: body.dlrCallbackUrl || null,
       isActive: body.isActive !== false,
       maxTps: body.maxTps || 10,
     }).returning();
     return NextResponse.json(created, { status: 201 });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }

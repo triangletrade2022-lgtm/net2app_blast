@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { db } from "@/db";
 import { smsLogs, clients, suppliers, smppSessions, license, trunks, routes } from "@/db/schema";
 import { eq, sql, gte } from "drizzle-orm";
+import { handleApiError } from "@/lib/api-error";
 
 export async function GET() {
   try {
@@ -102,7 +103,6 @@ export async function GET() {
       hourlyStats,
     });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return handleApiError(e);
   }
 }
