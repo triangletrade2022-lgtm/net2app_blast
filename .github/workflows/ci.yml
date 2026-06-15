@@ -1,0 +1,118 @@
+# ──────────────────────────────────────────────────────
+# Net2App Blast — CI Workflow
+# Runs typecheck, lint, and build on every push/PR
+# ──────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────
+  # Validate: typecheck + lint + build
+  # ────────────────────────────────────────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: net2app_db
+          POSTGRES_USER: net2app_user
+          POSTGRES_PASSWORD: ci_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type check
+        run: npm run typecheck
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+        env:
+          DATABASE_URL: postgresql://net2app_user:ci_password@127.0.0.1:5432/net2app_db
+          JWT_SECRET: ci-jwt-secret-for-build
+          NODE_ENV: production
+
+  # ────────────────────────────────────────────────────
+  # SMPP gateway: Python syntax + lint
+  # ────────────────────────────────────────────────────
+  smpp-gateway:
+    name: SMPP Gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install smppy smpp.pdu aiohttp psycopg2-binary ruff
+
+      - name: Python lint (ruff)
+        run: ruff check smpp_gateway/
+
+      - name: Python syntax check
+        run: python -m py_compile smpp_gateway/smpp_server.py
+
+      - name: Validate bash scripts
+        run: |
+          bash -n scripts/smsc-monitor.sh
+          bash -n scripts/health-check.sh
+          bash -n install-net2app.sh
+
+  # ────────────────────────────────────────────────────
+  # Notify on failure
+  # ────────────────────────────────────────────────────
+  summary:
+    name: Summary
+    needs: [validate, smpp-gateway]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Report status
+        run: |
+          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Validate** (typecheck + lint + build): ${{ needs.validate.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SMPP Gateway** (ruff + py_compile + bash syntax): ${{ needs.smpp-gateway.result }}" >> $GITHUB_STEP_SUMMARY

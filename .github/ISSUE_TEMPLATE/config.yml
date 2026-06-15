@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 Documentation
+    url: https://github.com/triangletrade2022-lgtm/net2app_blast/blob/master/README.md
+    about: Check the README and INSTALLATION-GUIDE before opening an issue
+  - name: 🤔 Support & FAQ
+    url: https://github.com/triangletrade2022-lgtm/net2app_blast/blob/master/SUPPORT.md
+    about: Common questions and troubleshooting tips
+  - name: 🔒 Report a Security Vulnerability
+    url: https://github.com/triangletrade2022-lgtm/net2app_blast/security/advisories
+    about: Please report security vulnerabilities privately — do not open a public issue
