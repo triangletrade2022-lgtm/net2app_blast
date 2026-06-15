@@ -1,5 +1,15 @@
 # Net2App Blast — Enterprise SMS Gateway Platform
 
+<p align="center">
+  <img src="https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white" alt="TypeScript"/>
+  <img src="https://img.shields.io/badge/Next.js-16-000000?logo=next.js&logoColor=white" alt="Next.js"/>
+  <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black" alt="React"/>
+  <img src="https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white" alt="PostgreSQL"/>
+  <img src="https://img.shields.io/badge/node-%3E%3D22-339933?logo=node.js&logoColor=white" alt="Node.js"/>
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License"/>
+  <img src="https://img.shields.io/badge/SMPP-v3.4-8B5CF6?logo=datadog&logoColor=white" alt="SMPP"/>
+</p>
+
 An enterprise-grade SMS gateway platform with SMPP/HTTP API support, real-time DLR tracking, dynamic routing, client & supplier management, invoicing, and a built-in monitoring dashboard.
 
 ## Architecture Overview
