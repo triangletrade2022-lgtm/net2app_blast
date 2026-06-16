@@ -1,8 +1,8 @@
 module.exports = {
   apps: [{
     name: 'net2app-blast',
-    script: 'node_modules/.bin/next',
-    args: 'start -p 3000',
+    script: '/home/ubuntu/net2app-platform/scripts/next-start.sh',
+    args: '',
     cwd: '/home/ubuntu/net2app-platform',
     instances: 1,
     exec_mode: 'fork',
