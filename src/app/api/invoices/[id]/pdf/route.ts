@@ -41,7 +41,7 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     }[] = (invoiceData as Record<string, unknown>)?.summary as any[] || [];
 
     // Create PDF
-    const doc = PDFDocument.create();
+    const doc = await PDFDocument.create();
     const font = await doc.embedFont(StandardFonts.Helvetica);
     const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
     let page = doc.addPage([612, 792]); // US Letter
@@ -122,6 +122,7 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
 
       // Table rows
       const rowH = 16;
+      let hx = margin;
       for (let i = 0; i < summary.length; i++) {
         const b = summary[i];
 
@@ -201,7 +202,7 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     page.drawText("Net2App Blast — Enterprise SMS Gateway", { x: margin, y, size: 7, font, color: gray });
     page.drawText(`Generated: ${new Date().toLocaleString()}`, { x: width - margin - 140, y, size: 7, font, color: gray });
 
-    const pdfBytes = await doc.save();
+    const pdfBytes = Buffer.from(await doc.save());
 
     return new NextResponse(pdfBytes, {
       status: 200,

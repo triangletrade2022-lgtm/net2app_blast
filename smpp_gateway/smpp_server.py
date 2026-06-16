@@ -356,19 +356,19 @@ class DatabaseBridge:
             "VALUES (%s,%s,%s,%s,%s,'supplier_to_client')",
             (log_id, msg_id, client_id, supplier_id, status))
 
-    def set_bind_status(self, table, entity_id, status, system_id=None, addr=None):
+    def set_bind_status(self, table, entity_id, status, system_id=None, addr=None, bind_type=None):
         self._execute(f"UPDATE {table} SET smpp_bind_status=%s, updated_at=NOW() WHERE id=%s", (status, entity_id))
         self._execute(
             "INSERT INTO smpp_sessions (entity_type, entity_id, system_id, bind_status, bind_type, remote_address, last_activity) "
-            "VALUES (%s,%s,%s,%s,'transceiver',%s,NOW()) "
+            "VALUES (%s,%s,%s,%s,%s,%s,NOW()) "
             "ON CONFLICT (id) DO UPDATE SET bind_status=%s, last_activity=NOW()",
-            ('client' if table == 'clients' else 'supplier', entity_id, system_id, status, addr, status))
+            ('client' if table == 'clients' else 'supplier', entity_id, system_id, status, bind_type or 'transceiver', addr, status))
 
     def get_active_smpp_suppliers(self):
         """Fetch all active SMPP suppliers from the database."""
         rows = self._fetchall(
             "SELECT id, name, smpp_system_id, smpp_password, smpp_host, smpp_port, "
-            "smpp_tls, smpp_bind_type, force_dlr, force_dlr_status "
+            "smpp_tls, smpp_bind_type, sender_id, force_dlr, force_dlr_status "
             "FROM suppliers WHERE connection_type='smpp' AND is_active=true "
             "AND smpp_host IS NOT NULL AND smpp_system_id IS NOT NULL "
             "ORDER BY priority ASC, id ASC")
@@ -378,7 +378,8 @@ class DatabaseBridge:
             {'id': r[0], 'name': r[1], 'system_id': r[2], 'password': r[3],
              'host': r[4], 'port': r[5] or 2775, 'tls': bool(r[6]),
              'bind_type': r[7] or 'transceiver',
-             'force_dlr': r[8], 'force_dlr_status': r[9]}
+             'sender_id': r[8],
+             'force_dlr': r[9], 'force_dlr_status': r[10]}
             for r in rows
         ]
 

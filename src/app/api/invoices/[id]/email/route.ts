@@ -25,7 +25,7 @@ const mccOperatorMap: Record<string, string> = {
 };
 
 async function generateInvoicePdf(inv: Record<string, unknown>, summary: any[]): Promise<Buffer> {
-  const doc = PDFDocument.create();
+  const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
   let page = doc.addPage([612, 792]);

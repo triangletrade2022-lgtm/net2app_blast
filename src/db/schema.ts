@@ -136,6 +136,7 @@ export const suppliers = pgTable("suppliers", {
   smppTls: boolean("smpp_tls").default(false),
   smppBindType: varchar("smpp_bind_type", { length: 50 }).default("transceiver"),
   smppTps: integer("smpp_tps").default(100),
+  senderId: varchar("sender_id", { length: 50 }),
   // HTTP API settings
   apiUrl: varchar("api_url", { length: 500 }),
   apiKey: varchar("api_key", { length: 255 }),

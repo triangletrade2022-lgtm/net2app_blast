@@ -98,7 +98,7 @@ export async function POST() {
         apiUrl: "https://api.smssheba.com/smsapiv3",
         apiKey: "17a0c9ff557a81eccafefb624443573c",
         apiMethod: "GET",
-        apiParams: JSON.stringify({ sender: "8809606776010" }),
+        apiParams: JSON.stringify({ sender: "8809606776306" }),
         responseType: "json",
         successField: "response.0.status",
         successValue: "0",

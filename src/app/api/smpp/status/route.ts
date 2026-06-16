@@ -7,9 +7,11 @@ import { handleApiError } from "@/lib/api-error";
 const SMPP_SERVER_STATUS_URL = "http://127.0.0.1:9000/api/smpp/status";
 
 interface SmppSupplierStatus {
-  supplier_id: number;
+  supplier_id?: number;
+  supplierId?: number;
   name: string;
-  system_id: string;
+  system_id?: string;
+  systemId?: string;
   host: string;
   port: number;
   connected: boolean;
@@ -21,8 +23,10 @@ interface SmppServerStatus {
   esmc_port: number;
   sessions: number;
   session_list: Array<{
-    client_id: number;
-    system_id: string;
+    client_id?: number;
+    clientId?: number;
+    system_id?: string;
+    systemId?: string;
     addr: string;
   }>;
   suppliers_connected: number;
@@ -66,19 +70,21 @@ export async function GET() {
 
     if (smppStatus?.suppliers) {
       for (const sup of smppStatus.suppliers) {
+        const supplierId = sup.supplier_id ?? sup.supplierId ?? 0;
+        const systemId = sup.system_id ?? sup.systemId ?? "";
         const bindStatus = sup.connected ? "bound" : "unbound";
 
         await db
           .update(suppliers)
           .set({ smppBindStatus: bindStatus, updatedAt: new Date() })
-          .where(eq(suppliers.id, sup.supplier_id));
+          .where(eq(suppliers.id, supplierId));
 
-        await upsertSession("supplier", sup.supplier_id, sup.system_id, bindStatus, `${sup.host}:${sup.port}`);
+        await upsertSession("supplier", supplierId, systemId, bindStatus, `${sup.host}:${sup.port}`);
 
         updatedSuppliers.push({
-          id: sup.supplier_id,
+          id: supplierId,
           name: sup.name,
-          system_id: sup.system_id,
+          system_id: systemId,
           connected: sup.connected,
         });
       }
@@ -90,27 +96,33 @@ export async function GET() {
 
     if (smppStatus?.session_list) {
       for (const sess of smppStatus.session_list) {
-        boundClientIds.add(sess.client_id);
+        // Support both Python snake_case and Node.js camelCase formats
+        const clientId = sess.client_id ?? sess.clientId ?? 0;
+        const systemId = sess.system_id ?? sess.systemId ?? "";
+        // Strip Python tuple address format like ('145.239.1.103', 55532)
+        const addr = sess.addr.replace(/^\('?/, "").replace(/',?\s*\d+\)$/g, "");
+
+        boundClientIds.add(clientId);
 
         await db
           .update(clients)
           .set({ smppBindStatus: "bound", updatedAt: new Date() })
-          .where(eq(clients.id, sess.client_id));
+          .where(eq(clients.id, clientId));
 
-        await upsertSession("client", sess.client_id, sess.system_id, "bound", sess.addr);
+        await upsertSession("client", clientId, systemId, "bound", addr);
 
         // Look up client name
         const [c] = await db
           .select({ name: clients.name })
           .from(clients)
-          .where(eq(clients.id, sess.client_id))
+          .where(eq(clients.id, clientId))
           .limit(1);
 
         enrichedClients.push({
-          id: sess.client_id,
+          id: clientId,
           name: c?.name || "Unknown",
-          system_id: sess.system_id,
-          addr: sess.addr,
+          system_id: systemId,
+          addr,
           connected: true,
         });
       }

@@ -28,6 +28,7 @@ export async function POST(req: NextRequest) {
       smppHost: body.smppHost || null,
       smppPort: body.smppPort || 2775,
       smppBindType: body.smppBindType || "transceiver",
+      senderId: body.senderId || null,
       smppTls: body.smppTls || false,
       apiUrl: body.apiUrl || null,
       apiKey: body.apiKey || null,

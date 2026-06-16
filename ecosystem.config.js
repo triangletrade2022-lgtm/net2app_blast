@@ -16,5 +16,21 @@ module.exports = {
     error_file: '/home/ubuntu/net2app-platform/logs/error.log',
     out_file: '/home/ubuntu/net2app-platform/logs/output.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
+  }, {
+    name: 'net2app-smsc',
+    script: 'java',
+    args: '-jar /home/ubuntu/net2app-platform/java-smsc-gateway/target/java-smsc-gateway-1.0.0.jar',
+    cwd: '/home/ubuntu/net2app-platform',
+    instances: 1,
+    exec_mode: 'fork',
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '512M',
+    env: {
+      DB_PASS: 'Ariyax2024Net2AppDB',
+    },
+    error_file: '/home/ubuntu/net2app-platform/logs/java_gateway_error.log',
+    out_file: '/home/ubuntu/net2app-platform/logs/java_gateway.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss',
   }]
 };
