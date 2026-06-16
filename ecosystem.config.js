@@ -32,5 +32,24 @@ module.exports = {
     error_file: '/home/ubuntu/net2app-platform/logs/java_gateway_error.log',
     out_file: '/home/ubuntu/net2app-platform/logs/java_gateway.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
+  }, {
+    name: 'net2app-smpp',
+    script: '/home/ubuntu/net2app-platform/smpp_env/bin/python',
+    args: '/home/ubuntu/net2app-platform/smpp_gateway/smpp_server.py',
+    cwd: '/home/ubuntu/net2app-platform',
+    instances: 1,
+    exec_mode: 'fork',
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '512M',
+    env: {
+      ESMC_PORT: '2776',
+      ESMC_HOST: '0.0.0.0',
+      API_PORT: '9001',
+      DB_PASS: 'Ariyax2024Net2AppDB',
+    },
+    error_file: '/home/ubuntu/net2app-platform/logs/smpp_python_error.log',
+    out_file: '/home/ubuntu/net2app-platform/logs/smpp_python.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss',
   }]
 };

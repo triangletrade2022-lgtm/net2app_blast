@@ -4,7 +4,10 @@ import { clients, suppliers, smppSessions } from "@/db/schema";
 import { eq, desc, and, inArray, not } from "drizzle-orm";
 import { handleApiError } from "@/lib/api-error";
 
-const SMPP_SERVER_STATUS_URL = "http://127.0.0.1:9000/api/smpp/status";
+const GATEWAY_URLS = [
+  "http://127.0.0.1:9000/api/smpp/status",  // Java SMSC gateway
+  "http://127.0.0.1:9001/api/smpp/status",  // Python SMPP gateway
+];
 
 interface SmppSupplierStatus {
   supplier_id?: number;
@@ -40,26 +43,72 @@ interface ClientSessionStatus {
   system_id: string;
   addr: string;
   connected: boolean;
+  gateway?: string;
+}
+
+/** Fetch status from a single gateway with timeout */
+async function fetchGateway(url: string): Promise<{ status: SmppServerStatus | null; error: string | null }> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (res.ok) {
+      return { status: await res.json(), error: null };
+    }
+    return { status: null, error: `Gateway returned ${res.status}` };
+  } catch (e: unknown) {
+    return { status: null, error: e instanceof Error ? e.message : "Unreachable" };
+  }
 }
 
 export async function GET() {
   try {
-    // Fetch real-time SMSC status from the SMPP server's internal REST API
-    let smppStatus: SmppServerStatus | null = null;
-    let fetchError: string | null = null;
+    // Fetch from both gateways in parallel
+    const results = await Promise.all(GATEWAY_URLS.map((url) => fetchGateway(url)));
 
-    try {
-      const res = await fetch(SMPP_SERVER_STATUS_URL, {
-        signal: AbortSignal.timeout(5000),
-      });
-      if (res.ok) {
-        smppStatus = await res.json();
-      } else {
-        fetchError = `SMPP server returned status ${res.status}`;
+    // Merge all statuses
+    const allSuppliers: SmppSupplierStatus[] = [];
+    const allSessions: Array<{ sess: { client_id?: number; clientId?: number; system_id?: string; systemId?: string; addr: string }; gateway: string }> = [];
+    const errors: string[] = [];
+    let totalPendingDlrs = 0;
+    let mergedServer = "unknown";
+    let mergedHost = "0.0.0.0";
+    let mergedPort = 2775;
+    let anyOk = false;
+
+    for (let i = 0; i < GATEWAY_URLS.length; i++) {
+      const { status, error } = results[i];
+      const label = i === 0 ? "Java" : "Python";
+
+      if (error) {
+        errors.push(`${label}: ${error}`);
+        continue;
       }
-    } catch (e: unknown) {
-      fetchError = e instanceof Error ? e.message : "Failed to reach SMPP server";
+      if (!status) continue;
+
+      anyOk = true;
+      mergedServer = status.server || "running";
+      mergedHost = status.esmc_host || mergedHost;
+      mergedPort = status.esmc_port || mergedPort;
+      totalPendingDlrs += status.pending_dlrs || 0;
+
+      if (status.suppliers) {
+        allSuppliers.push(...status.suppliers);
+      }
+
+      if (status.session_list) {
+        for (const sess of status.session_list) {
+          allSessions.push({ sess, gateway: label });
+        }
+      }
     }
+
+    // Deduplicate suppliers by supplier_id/supplierId
+    const seenSuppliers = new Set<number>();
+    const dedupedSuppliers = allSuppliers.filter((sup) => {
+      const id = sup.supplier_id ?? sup.supplierId ?? 0;
+      if (seenSuppliers.has(id)) return false;
+      seenSuppliers.add(id);
+      return true;
+    });
 
     // ——— Update suppliers (SMSC) ———
     const updatedSuppliers: Array<{
@@ -67,91 +116,83 @@ export async function GET() {
       name: string;
       system_id: string;
       connected: boolean;
+      gateway?: string;
     }> = [];
 
-    if (smppStatus?.suppliers) {
-      for (const sup of smppStatus.suppliers) {
-        const supplierId = sup.supplier_id ?? sup.supplierId ?? 0;
-        const systemId = sup.system_id ?? sup.systemId ?? "";
-        const bindStatus = sup.connected ? "bound" : "unbound";
+    for (const sup of dedupedSuppliers) {
+      const supplierId = sup.supplier_id ?? sup.supplierId ?? 0;
+      const systemId = sup.system_id ?? sup.systemId ?? "";
+      const bindStatus = sup.connected ? "bound" : "unbound";
 
-        await db
-          .update(suppliers)
-          .set({ smppBindStatus: bindStatus, updatedAt: new Date() })
-          .where(eq(suppliers.id, supplierId));
+      await db
+        .update(suppliers)
+        .set({ smppBindStatus: bindStatus, updatedAt: new Date() })
+        .where(eq(suppliers.id, supplierId));
 
-        await upsertSession("supplier", supplierId, systemId, bindStatus, `${sup.host}:${sup.port}`);
+      await upsertSession("supplier", supplierId, systemId, bindStatus, `${sup.host}:${sup.port}`);
 
-        updatedSuppliers.push({
-          id: supplierId,
-          name: sup.name,
-          system_id: systemId,
-          connected: sup.connected,
-        });
-      }
+      updatedSuppliers.push({
+        id: supplierId,
+        name: sup.name,
+        system_id: systemId,
+        connected: sup.connected,
+      });
     }
 
-    // ——— Update clients (ESME) ———
+    // ——— Update clients (ESME) from all gateways ———
     const boundClientIds = new Set<number>();
     const enrichedClients: ClientSessionStatus[] = [];
 
-    if (smppStatus?.session_list) {
-      for (const sess of smppStatus.session_list) {
-        // Support both Python snake_case and Node.js camelCase formats
-        const clientId = sess.client_id ?? sess.clientId ?? 0;
-        const systemId = sess.system_id ?? sess.systemId ?? "";
-        // Strip Python tuple address format like ('145.239.1.103', 55532)
-        const addr = sess.addr.replace(/^\('?/, "").replace(/',?\s*\d+\)$/g, "");
+    for (const { sess, gateway } of allSessions) {
+      const clientId = sess.client_id ?? sess.clientId ?? 0;
+      const systemId = sess.system_id ?? sess.systemId ?? "";
+      const addr = sess.addr.replace(/^\('?/, "").replace(/',?\s*\d+\)$/g, "");
 
-        boundClientIds.add(clientId);
+      boundClientIds.add(clientId);
 
-        await db
-          .update(clients)
-          .set({ smppBindStatus: "bound", updatedAt: new Date() })
-          .where(eq(clients.id, clientId));
+      await db
+        .update(clients)
+        .set({ smppBindStatus: "bound", updatedAt: new Date() })
+        .where(eq(clients.id, clientId));
 
-        await upsertSession("client", clientId, systemId, "bound", addr);
+      await upsertSession("client", clientId, systemId, "bound", addr);
 
-        // Look up client name
-        const [c] = await db
-          .select({ name: clients.name })
-          .from(clients)
-          .where(eq(clients.id, clientId))
-          .limit(1);
+      const [c] = await db
+        .select({ name: clients.name })
+        .from(clients)
+        .where(eq(clients.id, clientId))
+        .limit(1);
 
-        enrichedClients.push({
-          id: clientId,
-          name: c?.name || "Unknown",
-          system_id: systemId,
-          addr,
-          connected: true,
-        });
-      }
+      enrichedClients.push({
+        id: clientId,
+        name: c?.name || "Unknown",
+        system_id: systemId,
+        addr,
+        connected: true,
+        gateway,
+      });
     }
 
-    // Stale cleanup: SMPP clients marked as bound in DB but NOT in session_list → unbound
-    // Also runs when session_list is empty (all previously bound clients become unbound)
-    const staleCondition = boundClientIds.size > 0
-      ? and(
-          eq(clients.connectionType, "smpp"),
-          eq(clients.smppBindStatus, "bound"),
-          not(inArray(clients.id, Array.from(boundClientIds))),
-        )
-      : and(
-          eq(clients.connectionType, "smpp"),
-          eq(clients.smppBindStatus, "bound"),
-        );
+    // Stale cleanup when at least one gateway responded
+    if (anyOk) {
+      const staleCondition = boundClientIds.size > 0
+        ? and(
+            eq(clients.connectionType, "smpp"),
+            eq(clients.smppBindStatus, "bound"),
+            not(inArray(clients.id, Array.from(boundClientIds))),
+          )
+        : and(
+            eq(clients.connectionType, "smpp"),
+            eq(clients.smppBindStatus, "bound"),
+          );
 
-    // Only run stale cleanup when SMPP server responded (even with empty list)
-    // When SMPP server is unreachable (fetchError set), skip cleanup to avoid false unbound
-    if (smppStatus) {
       await db
         .update(clients)
         .set({ smppBindStatus: "unbound", updatedAt: new Date() })
         .where(staleCondition);
     }
 
-    // Also get SMPP clients that should be bound but are currently unbound (disconnected)
+    // Also include SMPP clients that are unbound
     const unboundSmppClients = await db
       .select({ id: clients.id, name: clients.name, smppSystemId: clients.smppSystemId })
       .from(clients)
@@ -176,16 +217,18 @@ export async function GET() {
     }
 
     return NextResponse.json({
-      server: smppStatus?.server ?? (smppStatus ? "running" : "unknown"),
-      esmc_host: smppStatus?.esmc_host ?? "0.0.0.0",
-      esmc_port: smppStatus?.esmc_port ?? 2775,
+      server: mergedServer,
+      esmc_host: mergedHost,
+      esmc_port: mergedPort,
+      gateways_checked: GATEWAY_URLS.length,
+      gateways_ok: results.filter((r) => !r.error).length,
+      gateway_errors: errors.length ? errors : null,
       esme_sessions: enrichedClients.filter((c) => c.connected).length,
       esme_session_list: enrichedClients,
       suppliers: updatedSuppliers,
       suppliers_connected: updatedSuppliers.filter((s) => s.connected).length,
       suppliers_total: updatedSuppliers.length,
-      pending_dlrs: smppStatus?.pending_dlrs ?? 0,
-      fetch_error: fetchError,
+      pending_dlrs: totalPendingDlrs,
       checked_at: new Date().toISOString(),
     });
   } catch (e: unknown) {
@@ -231,4 +274,3 @@ async function upsertSession(
     });
   }
 }
-

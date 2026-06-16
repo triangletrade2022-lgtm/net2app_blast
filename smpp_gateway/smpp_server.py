@@ -4,7 +4,7 @@ Net2App Blast - SMPP Gateway Server (v3)
 =========================================
 - ESMC: Uses smppy.Application for clean, stable PDU handling
 - SMSC: Connects to external suppliers via smpp.pdu over TCP
-- REST API bridge on port 9000
+- REST API bridge on port 9001
 - Keeps bind up 24/7 with auto-reconnect + keepalive
 """
 
@@ -124,8 +124,9 @@ DB_CONFIG = {
     'password': 'Ariyax2024Net2AppDB',
 }
 
-ESMC_HOST = '0.0.0.0'
-ESMC_PORT = 2775
+ESMC_HOST = os.environ.get('ESMC_HOST', '0.0.0.0')
+ESMC_PORT = int(os.environ.get('ESMC_PORT', '2776'))
+API_PORT = int(os.environ.get('API_PORT', '9001'))
 
 
 
@@ -1517,9 +1518,9 @@ class SmppGatewayServer:
         app.router.add_post('/api/smpp/rebind', rebind)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, '127.0.0.1', 9000)
+        site = web.TCPSite(runner, '127.0.0.1', API_PORT)
         await site.start()
-        logger.info(f"REST API bridge: http://127.0.0.1:9000")
+        logger.info(f"REST API bridge: http://127.0.0.1:{API_PORT}")
         while self.running:
             await asyncio.sleep(5)
         await runner.cleanup()
@@ -1616,7 +1617,7 @@ class SmppGatewayServer:
         logger.info("║   Net2App Blast SMPP Gateway Server v3     ║")
         logger.info("╠══════════════════════════════════════════════╣")
         logger.info(f"║  ESMC:  {ESMC_HOST}:{ESMC_PORT} (smppy)                     ║")
-        logger.info(f"║  REST:  http://127.0.0.1:9000              ║")
+        logger.info(f"║  REST:  http://127.0.0.1:{API_PORT}              ║")
         logger.info(f"║  SMSC:  Dynamic (from DB)          ║")
         logger.info("╚══════════════════════════════════════════════╝")
 
