@@ -126,35 +126,11 @@ public class EsmeHandler implements SmppServerHandler {
             return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
         }
 
-        // ── Step 3: Route to the specific supplier from the route ──
-        SupplierClient supplier = supplierManager.getClient(route.supplierId());
-        if (supplier == null || !supplier.isConnected()) {
-            System.err.println("[SMS] Supplier " + route.supplierName() + " (id=" + route.supplierId() + ") not connected");
-            if (smsLogger != null) smsLogger.logFailed("N/A", clientId, clientSysId, src, dest, smsText, "supplier_not_connected");
-            return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
-        }
-
-        // ── Step 4: Submit to supplier ──
-        try {
-            SubmitSmResp resp = supplier.getSession().submitSm(sm, Duration.ofSeconds(10));
-            String msgId = resp.messageId();
-            System.out.println("[SMS] Routed via " + supplier.getName() + " msgId=" + msgId);
-
-            // Store for DLR correlation
-            pendingDlrs.put(msgId, session);
-            dlrSuppliers.put(msgId, route.supplierId());
-            warnIfPendingDlrsLarge();
-
-            // Log to sms_logs with full routing/billing details
-            if (smsLogger != null) {
-                smsLogger.logSubmit(msgId, clientId, clientSysId, route, src, dest, smsText);
-            }
-
-            return SubmitSmResult.success(msgId);
-        } catch (Exception e) {
-            System.err.println("[SMS] Supplier " + supplier.getName() + " submit failed: " + e.getMessage());
-            if (smsLogger != null) smsLogger.logFailed("N/A", clientId, clientSysId, src, dest, smsText, "submit_error:" + e.getMessage());
-            return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
+        // ── Step 3: Route via SMPP or HTTP depending on supplier type ──
+        if ("http".equalsIgnoreCase(route.supplierConnType())) {
+            return handleHttpSubmit(sm, src, dest, smsText, clientId, clientSysId, route, session);
+        } else {
+            return handleSmppSubmit(sm, src, dest, smsText, clientId, clientSysId, route, session);
         }
     }
 
@@ -268,6 +244,72 @@ public class EsmeHandler implements SmppServerHandler {
             }
         } catch (Exception e) {
             System.err.println("[DLR:" + supplierName + "] Forward failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Submit SMS via HTTP supplier API.
+     */
+    private SubmitSmResult handleHttpSubmit(SubmitSm sm, String src, String dest, String smsText,
+                                             int clientId, String clientSysId,
+                                             RouteResolver.RouteInfo route, SmppServerSession session) {
+        HttpSupplierClient httpSupplier = supplierManager.getHttpClient(route.supplierId());
+        if (httpSupplier == null) {
+            System.err.println("[SMS] HTTP supplier " + route.supplierName() + " (id=" + route.supplierId() + ") not loaded");
+            if (smsLogger != null) smsLogger.logFailed("N/A", clientId, clientSysId, src, dest, smsText, "supplier_not_connected");
+            return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
+        }
+
+        System.out.println("[SMS] Routing via HTTP: " + httpSupplier.getName());
+        HttpSupplierClient.HttpSendResult result = httpSupplier.send(src, dest, smsText);
+
+        if (result.success()) {
+            String msgId = result.messageId();
+            System.out.println("[SMS] HTTP delivered via " + httpSupplier.getName() + " msgId=" + msgId);
+
+            if (smsLogger != null) {
+                smsLogger.logSubmit(msgId, clientId, clientSysId, route, src, dest, smsText);
+            }
+            return SubmitSmResult.success(msgId);
+        } else {
+            System.err.println("[SMS] HTTP supplier " + httpSupplier.getName() + " failed: " + result.error());
+            if (smsLogger != null) smsLogger.logFailed("N/A", clientId, clientSysId, src, dest, smsText,
+                    "http_error:" + (result.error() != null ? result.error() : "unknown"));
+            return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
+        }
+    }
+
+    /**
+     * Submit SMS via SMPP supplier.
+     */
+    private SubmitSmResult handleSmppSubmit(SubmitSm sm, String src, String dest, String smsText,
+                                             int clientId, String clientSysId,
+                                             RouteResolver.RouteInfo route, SmppServerSession session) {
+        SupplierClient supplier = supplierManager.getClient(route.supplierId());
+        if (supplier == null || !supplier.isConnected()) {
+            System.err.println("[SMS] Supplier " + route.supplierName() + " (id=" + route.supplierId() + ") not connected");
+            if (smsLogger != null) smsLogger.logFailed("N/A", clientId, clientSysId, src, dest, smsText, "supplier_not_connected");
+            return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
+        }
+
+        try {
+            SubmitSmResp resp = supplier.getSession().submitSm(sm, Duration.ofSeconds(10));
+            String msgId = resp.messageId();
+            System.out.println("[SMS] Routed via " + supplier.getName() + " msgId=" + msgId);
+
+            pendingDlrs.put(msgId, session);
+            dlrSuppliers.put(msgId, route.supplierId());
+            warnIfPendingDlrsLarge();
+
+            if (smsLogger != null) {
+                smsLogger.logSubmit(msgId, clientId, clientSysId, route, src, dest, smsText);
+            }
+
+            return SubmitSmResult.success(msgId);
+        } catch (Exception e) {
+            System.err.println("[SMS] Supplier " + supplier.getName() + " submit failed: " + e.getMessage());
+            if (smsLogger != null) smsLogger.logFailed("N/A", clientId, clientSysId, src, dest, smsText, "submit_error:" + e.getMessage());
+            return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
         }
     }
 

@@ -6,7 +6,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Manages all upstream SMSC supplier connections.
- * Loads active SMPP suppliers from PostgreSQL and connects them.
+ * Loads active SMPP and HTTP suppliers from PostgreSQL.
  */
 public class SupplierManager {
     private final String dbUrl;
@@ -14,6 +14,7 @@ public class SupplierManager {
     private final String dbPass;
     private final DlrForwarder dlrForwarder;
     private final Map<Integer, SupplierClient> clients = new ConcurrentHashMap<>();
+    private final Map<Integer, HttpSupplierClient> httpClients = new ConcurrentHashMap<>();
 
     public SupplierManager(String dbUrl, String dbUser, String dbPass, DlrForwarder dlrForwarder) {
         this.dbUrl = dbUrl;
@@ -23,12 +24,13 @@ public class SupplierManager {
     }
 
     public void connectAll() {
-        String sql = "SELECT id, name, smpp_host, smpp_port, smpp_system_id, smpp_password, " +
-                     "sender_id " +
-                     "FROM suppliers WHERE connection_type = 'smpp' AND is_active = true";
+        // ── Load SMPP suppliers ──
+        String smppSql = "SELECT id, name, smpp_host, smpp_port, smpp_system_id, smpp_password, " +
+                        "sender_id " +
+                        "FROM suppliers WHERE connection_type = 'smpp' AND is_active = true";
         try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass);
              Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
+             ResultSet rs = stmt.executeQuery(smppSql)) {
             while (rs.next()) {
                 int id = rs.getInt("id");
                 String name = rs.getString("name");
@@ -42,15 +44,50 @@ public class SupplierManager {
 
                 SupplierClient client = new SupplierClient(id, name, host, port, sysId, pass, senderId, dlrForwarder);
                 clients.put(id, client);
-                client.connect(); // Connect synchronously for now
+                client.connect();
             }
         } catch (SQLException e) {
-            System.err.println("[SupplierManager] DB error: " + e.getMessage());
+            System.err.println("[SupplierManager] SMPP load error: " + e.getMessage());
+        }
+
+        // ── Load HTTP suppliers ──
+        String httpSql = "SELECT id, name, api_url, api_key, api_method, sender_id, " +
+                        "success_field, success_value, message_id_field " +
+                        "FROM suppliers WHERE connection_type = 'http' AND is_active = true";
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass);
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(httpSql)) {
+            while (rs.next()) {
+                int id = rs.getInt("id");
+                String name = rs.getString("name");
+                String apiUrl = rs.getString("api_url");
+                String apiKey = rs.getString("api_key");
+                String apiMethod = rs.getString("api_method");
+                String senderId = rs.getString("sender_id");
+                String successField = rs.getString("success_field");
+                String successValue = rs.getString("success_value");
+                String msgIdField = rs.getString("message_id_field");
+
+                if (apiUrl == null || apiUrl.isEmpty()) continue;
+
+                HttpSupplierClient httpClient = new HttpSupplierClient(
+                        id, name, apiUrl, apiKey, apiMethod, senderId,
+                        successField, successValue, msgIdField);
+                httpClients.put(id, httpClient);
+                System.out.println("[SupplierManager] HTTP supplier loaded: " + name
+                        + " (id=" + id + ")");
+            }
+        } catch (SQLException e) {
+            System.err.println("[SupplierManager] HTTP load error: " + e.getMessage());
         }
     }
 
     public SupplierClient getClient(int supplierId) {
         return clients.get(supplierId);
+    }
+
+    public HttpSupplierClient getHttpClient(int supplierId) {
+        return httpClients.get(supplierId);
     }
 
     public Collection<SupplierClient> getAllClients() {
@@ -68,6 +105,18 @@ public class SupplierManager {
             info.put("host", c.getHost());
             info.put("port", c.getPort());
             info.put("connected", c.isConnected());
+            info.put("connectionType", "smpp");
+            result.add(info);
+        }
+        for (HttpSupplierClient hc : httpClients.values()) {
+            Map<String, Object> info = new LinkedHashMap<>();
+            info.put("supplierId", hc.getSupplierId());
+            info.put("name", hc.getName());
+            info.put("systemId", "http");
+            info.put("host", "http");
+            info.put("port", 0);
+            info.put("connected", true);
+            info.put("connectionType", "http");
             result.add(info);
         }
         return result;
