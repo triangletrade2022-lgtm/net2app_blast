@@ -20,11 +20,28 @@ export function generateCode(prefix: string): string {
   return `${prefix}_${random}`;
 }
 
+export function isGsm7(text: string): boolean {
+  return /^[\x20-\x7E\n\r]*$/.test(text);
+}
+
+export function getSmsEncoding(text: string): "GSM-7" | "UCS-2" {
+  return isGsm7(text) ? "GSM-7" : "UCS-2";
+}
+
+export function getSmsByteSize(text: string): number {
+  if (isGsm7(text)) {
+    // GSM-7: 7 bits per char, packed into octets
+    return Math.ceil((text.length * 7) / 8);
+  }
+  // UCS-2: 2 bytes per character
+  return text.length * 2;
+}
+
 export function calculateSmsParts(text: string): number {
-  const isGsm = /^[\x20-\x7E\n\r]*$/.test(text);
-  if (isGsm) {
+  if (isGsm7(text)) {
     return text.length <= 160 ? 1 : Math.ceil(text.length / 153);
   }
+  // UCS-2 (Unicode): 70 chars single part, 67 per part for multipart
   return text.length <= 70 ? 1 : Math.ceil(text.length / 67);
 }
 

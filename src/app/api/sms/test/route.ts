@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { smsLogs, clients, suppliers, routes, routeTrunks, trunks, clientRates, supplierRates, license, operators } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
-import { generateMessageId, calculateSmsParts } from "@/lib/helpers";
+import { generateMessageId, calculateSmsParts, getSmsByteSize, getSmsEncoding } from "@/lib/helpers";
 import { handleApiError } from "@/lib/api-error";
 import {
   isStatusCodeDelivered,
@@ -106,6 +106,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ═══ BALANCE + CREDIT CHECK ═══
+    const encoding = getSmsEncoding(messageText || "");
     const parts = calculateSmsParts(messageText || "");
     const cost = supplierRateVal * parts;
     const pay = clientRateVal * parts;
@@ -136,7 +137,7 @@ export async function POST(req: NextRequest) {
     // ═══ SEND ═══
     const messageId = generateMessageId();
     const inMsgId = Date.now().toString();
-    const smsBytes = new TextEncoder().encode(messageText || "").length;
+    const smsBytes = getSmsByteSize(messageText || "");
     const sendTime = new Date();
 
     let supplierMsgId = "", outMsgId = "";
@@ -241,7 +242,7 @@ export async function POST(req: NextRequest) {
       supplierUser: supplier.supplierCode || supplier.name,
       routeId: parsedRouteId, routeName, trunkId: trunkInfo.id, channel,
       device: trunkInfo.name || supplier.name || "Direct",
-      msgType: "SMS", businessType: testMode ? "Test SMS" : "Default type", sendType: "Device",
+      msgType: encoding === "UCS-2" ? "UNICODE" : "SMS", businessType: testMode ? "Test SMS" : (encoding === "UCS-2" ? "Unicode SMS" : "GSM-7 SMS"), sendType: "Device",
       sender: sender || "Net2App", oriReceiver: recipient, recipient, dstReceiver: recipient.replace(/^00/, "").replace(/^\+/, ""),
       messageText, destSms: messageText, smsBytes, destSmsBytes: smsBytes, parts, chargedPoints: parts,
       status: finalStatus as "pending"|"submitted"|"delivered"|"failed"|"rejected"|"expired",

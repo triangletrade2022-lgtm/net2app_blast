@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { smsLogs, clients, suppliers, routes, routeTrunks, trunks, clientRates, supplierRates, license, dlrQueue } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
-import { generateMessageId, calculateSmsParts } from "@/lib/helpers";
+import { generateMessageId, calculateSmsParts, getSmsByteSize, getSmsEncoding } from "@/lib/helpers";
 import { handleApiError } from "@/lib/api-error";
 import {
   isStatusCodeDelivered,
@@ -117,6 +117,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ── Balance + Credit Check ──
+    const encoding = getSmsEncoding(smstext || "");
     const parts = calculateSmsParts(smstext || "");
     const cost = supplierRateVal * parts;
     const pay = clientRateVal * parts;
@@ -142,7 +143,7 @@ export async function POST(req: NextRequest) {
     // ── Send ──
     const messageId = generateMessageId();
     const inMsgId = Date.now().toString();
-    const smsBytes = new TextEncoder().encode(smstext || "").length;
+    const smsBytes = getSmsByteSize(smstext || "");
     const sendTime = new Date();
 
     let supplierMsgId = "", outMsgId = "";
@@ -216,7 +217,7 @@ export async function POST(req: NextRequest) {
       supplierId: supplier.id, supplierUser: supplier.supplierCode || supplier.name,
       routeId: parsedRouteId, routeName, trunkId: trunkInfo.id, channel,
       device: trunkInfo.name || supplier.name || "Direct", port: trunkInfo.port,
-      msgType: "SMS", businessType: "Default type", sendType: "Device",
+      msgType: encoding === "UCS-2" ? "UNICODE" : "SMS", businessType: encoding === "UCS-2" ? "Unicode SMS" : "GSM-7 SMS", sendType: "Device",
       sender: sender || "Net2App", oriReceiver: msisdn, recipient: msisdn, dstReceiver: msisdn.replace(/^00/, "").replace(/^\+/, ""),
       messageText: smstext, destSms: smstext, smsBytes, destSmsBytes: smsBytes, parts, chargedPoints: parts,
       status: finalStatus as "pending"|"submitted"|"delivered"|"failed"|"rejected"|"expired",
