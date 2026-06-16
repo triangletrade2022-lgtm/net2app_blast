@@ -187,8 +187,21 @@ export async function POST(req: NextRequest) {
       } catch (err) { smsStatus = "failed"; sendResult = "failed"; sendReason = err instanceof Error ? err.message : "API timeout"; }
     }
 
-    // ── Balance Deduction (only on delivered/success) ──
+    // Force DLR fallback — ONLY when supplier accepted (not failed, not already delivered)
+    // Client sees "delivered" but supplier stays "submitted" — client charged, supplier NOT
+    let isForceDlr = false;
+    if (smsStatus !== "failed" && smsStatus !== "delivered" && !deliverResult && (forceDlrParam !== undefined ? forceDlrParam : (client.forceDlr || supplier.forceDlr))) {
+      dlrStatus = client.forceDlrStatus || supplier.forceDlrStatus || "delivered";
+      deliverResult = dlrStatus; deliverTime = new Date();
+      isForceDlr = true;
+    }
+
+    // ── Balance Deduction ──
+    // Real delivery (supplier confirmed): charge BOTH client and supplier
+    // Force DLR (supplier submitted only): charge CLIENT ONLY — supplier NOT charged
+    // Failed: charge nobody
     if (smsStatus === "delivered") {
+      // Real supplier delivery — charge both
       if (client.billingType === "on_submit") {
         let rem = pay; let nb = clientBal; let nc = clientCred;
         if (nb >= rem) { nb -= rem; rem = 0; } else { rem -= nb; nb = 0; nc = Math.max(0, nc - rem); }
@@ -199,17 +212,16 @@ export async function POST(req: NextRequest) {
         if (nb >= rem) { nb -= rem; rem = 0; } else { rem -= nb; nb = 0; nc = Math.max(0, nc - rem); }
         await db.update(suppliers).set({ currentBalance: String(nb), creditLimit: String(nc), updatedAt: new Date() }).where(eq(suppliers.id, supplier.id));
       }
-    }
-
-    // Force DLR fallback — ONLY when supplier accepted the SMS (not failed)
-    // Never override a supplier's explicit failure with a forced "delivered" status
-    if (smsStatus !== "failed" && !deliverResult && (forceDlrParam !== undefined ? forceDlrParam : (client.forceDlr || supplier.forceDlr))) {
-      dlrStatus = client.forceDlrStatus || supplier.forceDlrStatus || "delivered";
-      deliverResult = dlrStatus; deliverTime = new Date();
+    } else if (isForceDlr) {
+      // Force DLR: charge CLIENT ONLY — supplier NOT charged, platform keeps margin
+      if (client.billingType === "on_submit") {
+        let rem = pay; let nb = clientBal; let nc = clientCred;
+        if (nb >= rem) { nb -= rem; rem = 0; } else { rem -= nb; nb = 0; nc = Math.max(0, nc - rem); }
+        await db.update(clients).set({ currentBalance: String(nb), creditLimit: String(nc), updatedAt: new Date() }).where(eq(clients.id, client.id));
+      }
     }
 
     // Final status: if supplier explicitly failed, status is ALWAYS failed
-    // Only allow "delivered" if the supplier accepted or a real DLR confirmed it
     const finalStatus = smsStatus === "failed" ? "failed" : (smsStatus === "delivered" ? "delivered" : (dlrStatus === "delivered" ? "delivered" : smsStatus));
     const doneTime = deliverTime || (smsStatus === "submitted" ? new Date() : null);
 

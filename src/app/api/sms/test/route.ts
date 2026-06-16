@@ -182,13 +182,19 @@ export async function POST(req: NextRequest) {
 
     // Force DLR fallback — ONLY when supplier accepted the SMS (not failed)
     // Never override a supplier's explicit failure with a forced "delivered" status
-    if (smsStatus !== "failed" && !deliverResult && (forceDlr !== undefined ? forceDlr : (client.forceDlr || supplier.forceDlr))) {
+    let isForceDlr = false;
+    if (smsStatus !== "failed" && smsStatus !== "delivered" && !deliverResult && (forceDlr !== undefined ? forceDlr : (client.forceDlr || supplier.forceDlr))) {
       dlrStatus = client.forceDlrStatus || supplier.forceDlrStatus || "delivered";
       deliverResult = dlrStatus; deliverTime = new Date();
+      isForceDlr = true;
     }
 
-    // ═══ BALANCE DEDUCTION (only on delivered/success) ═══
+    // ═══ BALANCE DEDUCTION ═══
+    // Real delivery (supplier confirmed): charge BOTH client and supplier
+    // Force DLR (supplier only submitted, not delivered): charge CLIENT ONLY
+    // Failed: charge nobody
     if (smsStatus === "delivered") {
+      // Real supplier delivery — charge both
       if (client.billingType === "on_submit") {
         let remaining = pay;
         let newClientBalance = clientBalance;
@@ -229,6 +235,29 @@ export async function POST(req: NextRequest) {
           updatedAt: new Date(),
         }).where(eq(suppliers.id, supplier.id));
       }
+    } else if (isForceDlr) {
+      // Force DLR: supplier submitted but not delivered — charge CLIENT ONLY
+      if (client.billingType === "on_submit") {
+        let remaining = pay;
+        let newClientBalance = clientBalance;
+        let newClientCredit = clientCredit;
+
+        if (newClientBalance >= remaining) {
+          newClientBalance -= remaining;
+          remaining = 0;
+        } else {
+          remaining -= newClientBalance;
+          newClientBalance = 0;
+          newClientCredit = Math.max(0, newClientCredit - remaining);
+        }
+
+        await db.update(clients).set({
+          currentBalance: String(newClientBalance),
+          creditLimit: String(newClientCredit),
+          updatedAt: new Date(),
+        }).where(eq(clients.id, client.id));
+      }
+      // Supplier NOT charged — platform keeps the margin
     }
 
     // Final status: if supplier explicitly failed, status is ALWAYS failed
