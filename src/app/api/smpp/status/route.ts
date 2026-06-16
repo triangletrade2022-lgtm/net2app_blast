@@ -18,19 +18,20 @@ interface SmppSupplierStatus {
 }
 
 interface SmppServerStatus {
-  server: string;
-  esmc_host: string;
-  esmc_port: number;
-  sessions: number;
-  session_list: Array<{
+  server?: string;
+  esmc_host?: string;
+  esmc_port?: number;
+  sessions?: number;
+  session_list?: Array<{
     client_id?: number;
     clientId?: number;
     system_id?: string;
     systemId?: string;
     addr: string;
   }>;
-  suppliers_connected: number;
-  suppliers: SmppSupplierStatus[];
+  suppliers_connected?: number;
+  suppliers?: SmppSupplierStatus[];
+  pending_dlrs?: number;
 }
 
 interface ClientSessionStatus {
@@ -175,14 +176,15 @@ export async function GET() {
     }
 
     return NextResponse.json({
-      server: smppStatus?.server ?? "unknown",
-      esmc_host: smppStatus?.esmc_host ?? "",
-      esmc_port: smppStatus?.esmc_port ?? 0,
+      server: smppStatus?.server ?? (smppStatus ? "running" : "unknown"),
+      esmc_host: smppStatus?.esmc_host ?? "0.0.0.0",
+      esmc_port: smppStatus?.esmc_port ?? 2775,
       esme_sessions: enrichedClients.filter((c) => c.connected).length,
       esme_session_list: enrichedClients,
       suppliers: updatedSuppliers,
       suppliers_connected: updatedSuppliers.filter((s) => s.connected).length,
       suppliers_total: updatedSuppliers.length,
+      pending_dlrs: smppStatus?.pending_dlrs ?? 0,
       fetch_error: fetchError,
       checked_at: new Date().toISOString(),
     });
