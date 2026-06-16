@@ -1,0 +1,1 @@
+ALTER TABLE "suppliers" ADD COLUMN "sender_id" varchar(50);

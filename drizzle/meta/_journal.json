@@ -8,6 +8,13 @@
       "when": 1781558791501,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1781631802023,
+      "tag": "0001_dizzy_inertia",
+      "breakpoints": true
     }
   ]
 }
