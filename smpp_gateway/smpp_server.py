@@ -362,7 +362,7 @@ class DatabaseBridge:
         self._execute(
             "INSERT INTO smpp_sessions (entity_type, entity_id, system_id, bind_status, bind_type, remote_address, last_activity) "
             "VALUES (%s,%s,%s,%s,%s,%s,NOW()) "
-            "ON CONFLICT (id) DO UPDATE SET bind_status=%s, last_activity=NOW()",
+            "ON CONFLICT (entity_type, entity_id) DO UPDATE SET bind_status=%s, last_activity=NOW()",
             ('client' if table == 'clients' else 'supplier', entity_id, system_id, status, bind_type or 'transceiver', addr, status))
 
     def get_active_smpp_suppliers(self):
@@ -1096,46 +1096,54 @@ class Net2AppSmppApplication(Application):
                             (msg_id,))
                         logger.warning(f"✗ Failed to forward: {msg_id}")
 
-                    # Queue DLR for delivery to client (via _dlr_consumer)
+                    # Queue force DLR only if client has force_dlr enabled
                     if fwd_ok:
-                        self.db.queue_dlr(log_id, msg_id, client_id, route['supplier_id'], 'delivered')
-                        self.db.update_dlr(msg_id, 'delivered')
-                        # Apply force DLR timeout delay before sending DLR to client
-                        try:
-                            tout_row, _ = self.db._fetchone(
-                                "SELECT force_dlr_timeout FROM clients WHERE id=%s", (client_id,))
-                            timeout_str = tout_row[0] if tout_row else '0'
-                            if timeout_str == 'random':
-                                dlr_delay = random.uniform(0, 5)
-                            else:
-                                try:
-                                    dlr_delay = float(timeout_str)
-                                except (ValueError, TypeError):
-                                    dlr_delay = 0.0
-                            if dlr_delay > 0:
-                                logger.info(f"DLR timeout: waiting {dlr_delay:.1f}s for {msg_id}")
-                                await asyncio.sleep(dlr_delay)
-                        except Exception as e:
-                            logger.warning(f"DLR timeout lookup failed: {e}")
-                        # Attempt immediate DLR send with proper esm_class=SMSC_DELIVERY_RECEIPT
-                        try:
-                            dlr_ok = await self.gateway._send_dlr_pdu(
-                                client._protocol,
-                                sender_number=source_number,
-                                recipient_number=dest_number,
-                                msg_id=msg_id,
-                                dlr_status='delivered',
-                            )
-                            if dlr_ok:
-                                self.db._execute(
-                                    "UPDATE dlr_queue SET processed=true, processed_at=NOW() "
-                                    "WHERE message_id=%s AND client_id=%s AND processed=false",
-                                    (msg_id, client_id))
-                                logger.info(f"DLR sent to {sysid} for {msg_id}")
-                            else:
-                                logger.warning(f"DLR immediate send failed for {msg_id}, will retry via consumer")
-                        except Exception as e:
-                            logger.error(f"DLR send failed: {e}")
+                        # Check client's force_dlr setting
+                        fd_row, _ = self.db._fetchone(
+                            "SELECT force_dlr FROM clients WHERE id=%s", (client_id,))
+                        client_force_dlr = bool(fd_row and fd_row[0]) if fd_row else False
+                        
+                        if client_force_dlr:
+                            self.db.queue_dlr(log_id, msg_id, client_id, route['supplier_id'], 'delivered')
+                            self.db.update_dlr(msg_id, 'delivered')
+                            # Apply force DLR timeout delay before sending DLR to client
+                            try:
+                                tout_row, _ = self.db._fetchone(
+                                    "SELECT force_dlr_timeout FROM clients WHERE id=%s", (client_id,))
+                                timeout_str = tout_row[0] if tout_row else '0'
+                                if timeout_str == 'random':
+                                    dlr_delay = random.uniform(0, 5)
+                                else:
+                                    try:
+                                        dlr_delay = float(timeout_str)
+                                    except (ValueError, TypeError):
+                                        dlr_delay = 0.0
+                                if dlr_delay > 0:
+                                    logger.info(f"DLR timeout: waiting {dlr_delay:.1f}s for {msg_id}")
+                                    await asyncio.sleep(dlr_delay)
+                            except Exception as e:
+                                logger.warning(f"DLR timeout lookup failed: {e}")
+                            # Attempt immediate DLR send with proper esm_class=SMSC_DELIVERY_RECEIPT
+                            try:
+                                dlr_ok = await self.gateway._send_dlr_pdu(
+                                    client._protocol,
+                                    sender_number=source_number,
+                                    recipient_number=dest_number,
+                                    msg_id=msg_id,
+                                    dlr_status='delivered',
+                                )
+                                if dlr_ok:
+                                    self.db._execute(
+                                        "UPDATE dlr_queue SET processed=true, processed_at=NOW() "
+                                        "WHERE message_id=%s AND client_id=%s AND processed=false",
+                                        (msg_id, client_id))
+                                    logger.info(f"Force DLR sent to {sysid} for {msg_id}")
+                                else:
+                                    logger.warning(f"Force DLR send failed for {msg_id}, will retry via consumer")
+                            except Exception as e:
+                                logger.error(f"Force DLR send failed: {e}")
+                        else:
+                            logger.info(f"Client {sysid} (ID={client_id}) has force_dlr=false, waiting for real DLR for {msg_id}")
                 else:
                     logger.warning(f"Rate validation failed: cr={cr} sr={sr}")
                     # Log failed SMS for rate issues too
@@ -1444,6 +1452,16 @@ class SmppGatewayServer:
                     'ip_address': req.remote or '',
                 }
                 log_id = self.db.log_sms(ld)
+
+                # Force DLR only if client has force_dlr enabled
+                if fwd_ok:
+                    fd_row, _ = self.db._fetchone(
+                        "SELECT force_dlr FROM clients WHERE id=%s", (client_id,))
+                    client_force_dlr = bool(fd_row and fd_row[0]) if fd_row else False
+                    if client_force_dlr:
+                        self.db.queue_dlr(log_id, msg_id, client_id, route['supplier_id'], 'delivered')
+                        self.db.update_dlr(msg_id, 'delivered')
+
                 return web.json_response({'success': fwd_ok, 'messageId': msg_id, 'logId': log_id})
             except Exception as e:
                 return web.json_response({'error': str(e)}, status=500)
@@ -1629,7 +1647,11 @@ class SmppGatewayServer:
         ]
 
         # Start ESMC server using a custom protocol that cleans up on disconnect
-        # and sends submit_sm_resp with message_id for DLR correlation
+        # Uses smppy native PDU handling (including submit_sm) — the base class
+        # already decodes PDUs, sends submit_sm_resp, handles concatenated
+        # messages, and calls app.handle_sms_received.
+        # The DLR text body contains the message_id (id:N2A...) so ESME clients
+        # can correlate DLRs even without the message_id in submit_sm_resp.
         class Net2AppSmppProtocol(SmppProtocol):
             def connection_lost(self, exc):
                 if self._client:
@@ -1648,58 +1670,6 @@ class SmppGatewayServer:
                 if pdu.command_id == CommandId.enquire_link_resp:
                     return  # Silent handling
                 await super().request_handler(pdu)
-
-            async def handle_data_received(self, data: bytes):
-                """Override to include message_id in submit_sm_resp.
-                This allows clients to correlate DLRs with their original submit_sm."""
-                file = io.BytesIO(data)
-                pdu = PDUEncoder().decode(file)
-
-                if pdu.command_id == CommandId.submit_sm:
-                    submit_sm = SubmitSM(sequence_number=pdu.sequence_number, **pdu.params)
-                    sms = SMStringEncoder().decode_SM(submit_sm).str
-
-                    # Generate message ID BEFORE responding so we can include it
-                    # in submit_sm_resp. The client receives this ID and can later
-                    # match it with the DLR text (id:N2A...).
-                    msg_id = self.app.gateway.gen_msg_id()
-
-                    # Send submit_sm_resp WITH message_id
-                    resp = SubmitSMResp(
-                        sequence_number=submit_sm.sequence_number,
-                        message_id=msg_id,
-                        status=CommandStatus.ESME_ROK,
-                    )
-                    self._send_response(resp)
-
-                    # Handle concatenated messages
-                    while (submit_sm.params.get('more_messages_to_send') ==
-                           MoreMessagesToSend.MORE_MESSAGES):
-                        pdu = PDUEncoder().decode(file)
-                        if pdu.command_id != CommandId.submit_sm:
-                            self.app.logger.error(
-                                f'Expected submit_sm, got {pdu.command_id}')
-                            break
-                        submit_sm = SubmitSM(
-                            sequence_number=pdu.sequence_number, **pdu.params)
-                        sms += SMStringEncoder().decode_SM(submit_sm).str
-                        resp = SubmitSMResp(
-                            sequence_number=submit_sm.sequence_number,
-                            message_id=msg_id,
-                            status=CommandStatus.ESME_ROK,
-                        )
-                        self._send_response(resp)
-
-                    # Call handler with pre-generated msg_id
-                    await self.app.handle_sms_received(
-                        client=self._client,
-                        source_number=submit_sm.params['source_addr'],
-                        dest_number=submit_sm.params['destination_addr'],
-                        text=sms,
-                        pre_generated_msg_id=msg_id,
-                    )
-                else:
-                    await super().handle_data_received(data)
 
         factory = lambda: Net2AppSmppProtocol(app=self.app)
         esmc_server = await self.loop.create_server(factory, host=ESMC_HOST,

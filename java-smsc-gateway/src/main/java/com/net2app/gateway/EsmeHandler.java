@@ -9,7 +9,9 @@ import io.smppgateway.smpp.types.*;
 import java.sql.*;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -26,13 +28,28 @@ public class EsmeHandler implements SmppServerHandler {
     private RouteResolver routeResolver;
     private final Map<String, SmppServerSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, Integer> clientIds = new ConcurrentHashMap<>();
+    private final Map<Integer, SmppServerSession> clientSessions = new ConcurrentHashMap<>(); // clientId → session (for DLR retry after reconnect)
     private final Map<String, SmppServerSession> pendingDlrs = new ConcurrentHashMap<>();
     private final Map<String, Integer> dlrSuppliers = new ConcurrentHashMap<>(); // msgId → supplierId
+    // DLR retry queue for deliveries that failed temporarily (session reconnect window)
+    private final ConcurrentLinkedQueue<DelayedDlr> dlrRetryQueue = new ConcurrentLinkedQueue<>();
+    // Force DLR scheduler — auto-generates a DLR if the supplier doesn't send one
+    private final ScheduledExecutorService forceDlrScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "force-dlr");
+        t.setDaemon(true);
+        return t;
+    });
+    /** Track which msgIds already had a forced DLR sent — prevents duplicates. */
+    private final Set<String> forceDlrSent = ConcurrentHashMap.newKeySet();
+
+    /** A DLR that failed to deliver and will be retried. */
+    private record DelayedDlr(String supplierName, DeliverSm dm, String receiptedMsgId, int clientId, long retryAtMillis) {}
 
     public EsmeHandler(String dbUrl, String dbUser, String dbPass) {
         this.dbUrl = dbUrl;
         this.dbUser = dbUser;
         this.dbPass = dbPass;
+        startDlrConsumer();
     }
 
     /** Set the supplier manager (called after construction to avoid circular dependency). */
@@ -73,6 +90,7 @@ public class EsmeHandler implements SmppServerHandler {
                     updateBindStatus(conn, "client", clientId, "bound", systemId, remote);
                     sessions.put(systemId, session);
                     clientIds.put(systemId, clientId);
+                    clientSessions.put(clientId, session);
                     return BindResult.success();
                 }
             }
@@ -119,8 +137,8 @@ public class EsmeHandler implements SmppServerHandler {
                 + " (cr=" + route.clientRate() + " sr=" + route.supplierRate()
                 + " cost=" + route.cost() + " pay=" + route.pay() + ")");
 
-        // ── Step 2: Check & deduct balance ──
-        if (!routeResolver.checkAndDeductBalance(clientId, route.supplierId(), route.pay(), route.cost())) {
+        // ── Step 2: Check balance (do NOT deduct yet — only deduct after supplier confirms success) ──
+        if (!routeResolver.checkBalance(clientId, route.supplierId(), route.pay(), route.cost())) {
             System.err.println("[SMS] Balance check failed for client=" + clientSysId);
             if (smsLogger != null) smsLogger.logFailed("N/A", clientId, clientSysId, src, dest, smsText, "insufficient_balance");
             return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
@@ -177,10 +195,17 @@ public class EsmeHandler implements SmppServerHandler {
     @Override
     public void sessionDestroyed(SmppServerSession session) {
         System.out.println("[ESME] Session destroyed: " + session.getSessionId());
-        sessions.remove(session.getSystemId());
-        clientIds.remove(session.getSystemId());
+        String sysId = session.getSystemId();
+        Integer removedClientId = clientIds.get(sysId);
+        sessions.remove(sysId);
+        clientIds.remove(sysId);
+        if (removedClientId != null) {
+            clientSessions.remove(removedClientId);
+        }
         // Clean up any pending DLRs for this session
         pendingDlrs.values().removeIf(s -> s == session);
+        // Clean up forceDlrSent entries whose sessions are gone
+        forceDlrSent.removeIf(mid -> !pendingDlrs.containsKey(mid));
         // Update DB to unbound
         updateBindStatus(null, "client", 0, "unbound", session.getSystemId(), null);
     }
@@ -213,6 +238,10 @@ public class EsmeHandler implements SmppServerHandler {
      * Forward a DLR received from a supplier back to the originating ESME client.
      * Extracts the original message ID from TLV (tag 0x001E) or parses the short message
      * text for "id:<msgId>", looks up the ESME session, and sends the DeliverSm.
+     *
+     * CRITICAL FIX: Always logs the DLR to the database even when the session is not found,
+     * so DLRs are never lost on gateway restart or client reconnect.
+     * Failed deliveries are queued for retry via the DLR consumer thread.
      */
     public void forwardDlr(String supplierName, DeliverSm dm) {
         String receiptedMsgId = extractReceiptedMessageId(dm);
@@ -221,9 +250,26 @@ public class EsmeHandler implements SmppServerHandler {
             return;
         }
 
-        SmppServerSession esmeSession = pendingDlrs.remove(receiptedMsgId);
+        String dlrText = dm.shortMessage() != null ? new String(dm.shortMessage()) : "";
+
+        // Use get() instead of remove() so intermediate DLRs (e.g. ACCEPTD)
+        // don't prevent final DLRs (e.g. DELIVRD) from being forwarded.
+        // Many SMSC suppliers send two DLRs: first ACCEPTD (submitted),
+        // then DELIVRD (delivered). Only remove from pendingDlrs when
+        // the DLR status is final (DELIVRD, UNDELIV, EXPIRED, REJECTD).
+        SmppServerSession esmeSession = pendingDlrs.get(receiptedMsgId);
+
         if (esmeSession == null) {
-            System.out.println("[DLR:" + supplierName + "] No ESME session found for msgId=" + receiptedMsgId);
+            System.out.println("[DLR:" + supplierName + "] No ESME session found for msgId=" + receiptedMsgId
+                    + " — logging DLR to DB, will retry via consumer");
+            // ALWAYS log to database even when session not found
+            logDlrToDatabase(receiptedMsgId, dlrText, receiptedMsgId, supplierName);
+            // Queue for retry in case client reconnects — look up clientId from DB
+            int cid = lookupClientId(receiptedMsgId);
+            if (cid > 0) {
+                dlrRetryQueue.add(new DelayedDlr(supplierName, dm, receiptedMsgId, cid,
+                        System.currentTimeMillis() + 5000));
+            }
             return;
         }
 
@@ -231,10 +277,9 @@ public class EsmeHandler implements SmppServerHandler {
             esmeSession.sendDeliverSm(dm);
             System.out.println("[DLR:" + supplierName + "] Forwarded msgId=" + receiptedMsgId
                     + " to ESME " + esmeSession.getSystemId());
+
             // Log DLR to sms_logs + dlr_queue
             if (smsLogger != null) {
-                String dlrText = dm.shortMessage() != null
-                        ? new String(dm.shortMessage()) : "";
                 String esmeSysId = esmeSession.getSystemId();
                 Integer esmeClientId = clientIds.get(esmeSysId);
                 Integer supId = dlrSuppliers.remove(receiptedMsgId);
@@ -242,9 +287,123 @@ public class EsmeHandler implements SmppServerHandler {
                         esmeClientId != null ? esmeClientId : 0,
                         supId != null ? supId : 0);
             }
+
+            // Only remove from pendingDlrs for final delivery statuses.
+            // Intermediate DLRs (ACCEPTD) stay in the map so the subsequent
+            // final DLR (DELIVRD) can still find the session.
+            String dlrStatus = parseDlrStatus(dlrText);
+            if (isFinalDlrStatus(dlrStatus)) {
+                pendingDlrs.remove(receiptedMsgId);
+            }
         } catch (Exception e) {
-            System.err.println("[DLR:" + supplierName + "] Forward failed: " + e.getMessage());
+            System.err.println("[DLR:" + supplierName + "] Forward failed: " + e.getMessage()
+                    + " — logging DLR to DB, will retry via consumer");
+            logDlrToDatabase(receiptedMsgId, dlrText, receiptedMsgId, supplierName);
+            int cid = lookupClientId(receiptedMsgId);
+            if (cid > 0) {
+                dlrRetryQueue.add(new DelayedDlr(supplierName, dm, receiptedMsgId, cid,
+                        System.currentTimeMillis() + 5000));
+            }
         }
+    }
+
+    /**
+     * Log a DLR to the database (sms_logs + dlr_queue) by looking up client_id
+     * and supplier_id from the sms_logs table using the supplier message ID.
+     */
+    private void logDlrToDatabase(String receiptedMsgId, String dlrText, String msgId, String supplierName) {
+        if (smsLogger == null) return;
+        int clientId = lookupClientId(msgId);
+        int supplierId = 0;
+        if (clientId > 0) {
+            Integer supId = dlrSuppliers.remove(receiptedMsgId);
+            supplierId = supId != null ? supId : 0;
+        }
+        if (clientId > 0 || supplierId > 0) {
+            smsLogger.logDlrWithQueue(receiptedMsgId, dlrText, clientId, supplierId);
+            System.out.println("[DLR:" + supplierName + "] Logged DLR to DB: msgId=" + receiptedMsgId
+                    + " client=" + clientId + " supplier=" + supplierId);
+        } else {
+            smsLogger.logDlrWithQueue(receiptedMsgId, dlrText, 0, 0);
+            System.out.println("[DLR:" + supplierName + "] Logged DLR to DB (no client found): msgId=" + receiptedMsgId);
+        }
+    }
+
+    /**
+     * Look up client_id from sms_logs by message_id or supplier_msg_id.
+     */
+    private int lookupClientId(String msgId) {
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT client_id FROM sms_logs WHERE message_id = ? LIMIT 1")) {
+                ps.setString(1, msgId);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    int cid = rs.getInt("client_id");
+                    if (cid > 0) return cid;
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT client_id FROM sms_logs WHERE supplier_msg_id = ? LIMIT 1")) {
+                ps.setString(1, msgId);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) return rs.getInt("client_id");
+            }
+        } catch (SQLException e) {
+            System.err.println("[DLR] lookupClientId error: " + e.getMessage());
+        }
+        return 0;
+    }
+
+    /**
+     * DLR Consumer: background thread that retries sending DLRs from the retry queue
+     * to reconnected client sessions. Polls every 2 seconds.
+     */
+    private void startDlrConsumer() {
+        Thread t = new Thread(() -> {
+            System.out.println("[DLR Consumer] Started — retrying queued DLRs every 2s");
+            while (true) {
+                try {
+                    Thread.sleep(2000);
+                    long now = System.currentTimeMillis();
+                    var it = dlrRetryQueue.iterator();
+                    while (it.hasNext()) {
+                        var d = it.next();
+                        if (now < d.retryAtMillis()) continue;
+                        String mid = d.receiptedMsgId();
+                        // Look up session by clientId — client may have reconnected with a new session
+                        SmppServerSession sess = clientSessions.get(d.clientId());
+                        if (sess == null) {
+                            // Session not found — DLR already logged to DB, remove old retries
+                            if (d.retryAtMillis() < now - 60000) {
+                                it.remove();
+                                System.out.println("[DLR Consumer] Expired retry for " + mid);
+                            }
+                            continue;
+                        }
+                        try {
+                            sess.sendDeliverSm(d.dm());
+                            System.out.println("[DLR Consumer] Retry succeeded: " + mid
+                                    + " -> " + sess.getSystemId());
+                            it.remove();
+                        } catch (Exception e) {
+                            System.out.println("[DLR Consumer] Retry failed for " + mid + ": " + e.getMessage());
+                            // Update retry time to try again later
+                            var updated = new DelayedDlr(d.supplierName(), d.dm(), mid, d.clientId(), now + 5000);
+                            it.remove();
+                            dlrRetryQueue.add(updated);
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    System.err.println("[DLR Consumer] Error: " + e.getMessage());
+                }
+            }
+        }, "dlr-consumer");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**
@@ -270,6 +429,10 @@ public class EsmeHandler implements SmppServerHandler {
             if (smsLogger != null) {
                 smsLogger.logSubmit(msgId, clientId, clientSysId, route, src, dest, smsText);
             }
+            // ── Deduct balance ONLY after supplier confirms success ──
+            routeResolver.deductAfterSuccess(clientId, route.supplierId(), route.pay(), route.cost());
+            // Force DLR: schedule auto-generated DLR if client/supplier has it enabled
+            scheduleForceDlr(msgId, session, clientId, route.supplierId(), src, dest);
             return SubmitSmResult.success(msgId);
         } else {
             System.err.println("[SMS] HTTP supplier " + httpSupplier.getName() + " failed: " + result.error());
@@ -304,6 +467,11 @@ public class EsmeHandler implements SmppServerHandler {
             if (smsLogger != null) {
                 smsLogger.logSubmit(msgId, clientId, clientSysId, route, src, dest, smsText);
             }
+            // ── Deduct balance ONLY after supplier confirms success ──
+            routeResolver.deductAfterSuccess(clientId, route.supplierId(), route.pay(), route.cost());
+
+            // Schedule force DLR if client or supplier has it enabled
+            scheduleForceDlr(msgId, session, clientId, route.supplierId(), src, dest);
 
             return SubmitSmResult.success(msgId);
         } catch (Exception e) {
@@ -311,10 +479,13 @@ public class EsmeHandler implements SmppServerHandler {
             if (smsLogger != null) smsLogger.logFailed("N/A", clientId, clientSysId, src, dest, smsText, "submit_error:" + e.getMessage());
             return SubmitSmResult.failure(CommandStatus.ESME_RSUBMITFAIL);
         }
-    }
+    }    /** Pattern to extract id:... from SMPP DLR short message text */
+    private static final Pattern DLR_ID_PATTERN =
+            Pattern.compile("\\bid:(\\S+)", Pattern.CASE_INSENSITIVE);
 
-    /** Pattern to extract id:... from SMPP DLR short message text */
-    private static final Pattern DLR_ID_PATTERN = Pattern.compile("\\bid:(\\S+)", Pattern.CASE_INSENSITIVE);
+    /** Pattern to extract stat:... from SMPP DLR short message text */
+    private static final Pattern DLR_STAT_PATTERN =
+            Pattern.compile("\\bstat:(\\S+)", Pattern.CASE_INSENSITIVE);
 
     /** Warn if pending DLR map grows large (indicates upstream DLR gaps). */
     private static final int PENDING_DLR_WARN_THRESHOLD = 1000;
@@ -346,6 +517,172 @@ public class EsmeHandler implements SmppServerHandler {
             }
         }
         return null;
+    }
+
+    /** Config loaded from DB for force DLR on a submission. */
+    private record ForceDlrConfig(boolean enabled, String status, double timeoutSeconds) {}
+
+    /**
+     * Load force DLR settings from the clients and suppliers tables.
+     * Client settings take precedence over supplier settings.
+     */
+    private ForceDlrConfig loadForceDlrConfig(int clientId, int supplierId) {
+        String sql = """
+            SELECT c.force_dlr, c.force_dlr_status, c.force_dlr_timeout,
+                   s.force_dlr as s_force_dlr, s.force_dlr_status as s_force_dlr_status
+            FROM clients c, suppliers s
+            WHERE c.id = ? AND s.id = ?
+            """;
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass);
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, clientId);
+            ps.setInt(2, supplierId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                boolean clientForce = rs.getBoolean("force_dlr");
+                boolean supplierForce = rs.getBoolean("s_force_dlr");
+                if (clientForce || supplierForce) {
+                    // Client status first, fallback to supplier
+                    String status = rs.getString("force_dlr_status");
+                    if (status == null || status.isEmpty()) {
+                        status = rs.getString("s_force_dlr_status");
+                    }
+                    if (status == null || status.isEmpty()) status = "delivered";
+
+                    String tout = rs.getString("force_dlr_timeout");
+                    if (tout == null || tout.isEmpty()) tout = "0";
+                    double timeout = 0;
+                    if ("random".equalsIgnoreCase(tout.trim())) {
+                        timeout = -1; // sentinel: random 0-5s
+                    } else {
+                        try {
+                            timeout = Double.parseDouble(tout.trim());
+                        } catch (NumberFormatException e) {
+                            timeout = 0;
+                        }
+                    }
+                    return new ForceDlrConfig(true, status, timeout);
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[ForceDLR] Config load error: " + e.getMessage());
+        }
+        return new ForceDlrConfig(false, "delivered", 0);
+    }
+
+    /**
+     * Schedule a forced DLR timer for a successfully submitted SMS.
+     *
+     * PRIORITY 1: Send the DLR back on the same SMPP session that received
+     * the submit_sm (stored in pendingDlrs). This is the standard SMPP
+     * requirement — the deliver_sm must go back on the same connection.
+     *
+     * PRIORITY 2: If the session is gone or send fails (e.g. client
+     * reconnected to a different gateway after a restart), fall back to
+     * the shared dlr_queue so the Python gateway's _dlr_consumer() can
+     * pick it up and deliver it to the client's active session.
+     */
+    private void scheduleForceDlr(String msgId, SmppServerSession session,
+                                   int clientId, int supplierId,
+                                   String src, String dest) {
+        ForceDlrConfig cfg = loadForceDlrConfig(clientId, supplierId);
+        if (!cfg.enabled()) return;
+
+        // Store the session reference for both direct delivery and
+        // real SMPP supplier DLRs (forwardDlr)
+        pendingDlrs.put(msgId, session);
+
+        long delayMs;
+        if (cfg.timeoutSeconds() < 0) {
+            delayMs = ThreadLocalRandom.current().nextLong(0, 5001); // 0-5 seconds
+        } else {
+            delayMs = (long) (cfg.timeoutSeconds() * 1000);
+        }
+
+        forceDlrScheduler.schedule(() -> {
+            try {
+                // Skip if a forced DLR was already sent for this msgId
+                if (!forceDlrSent.add(msgId)) return;
+
+                String status = cfg.status();
+                String dlrText = buildDlrText(msgId, status);
+
+                // PRIORITY 1: Try direct delivery on the same session
+                SmppServerSession esmeSession = pendingDlrs.get(msgId);
+                if (esmeSession != null) {
+                    DeliverSm dm = DeliverSm.builder()
+                            .asDeliveryReceipt()
+                            .sourceAddress((byte) 0, (byte) 0, dest)
+                            .destAddress((byte) 0, (byte) 0, src)
+                            .shortMessage(dlrText.getBytes(java.nio.charset.StandardCharsets.US_ASCII))
+                            .build();
+
+                    try {
+                        esmeSession.sendDeliverSm(dm);
+                        dlrSuppliers.remove(msgId);
+                        System.out.println("[ForceDLR] Sent on same session for msgId=" + msgId
+                                + " status=" + status);
+                        // Log to DB as already processed
+                        if (smsLogger != null) {
+                            smsLogger.logDlrWithQueue(msgId, dlrText, clientId, supplierId);
+                        }
+                        return; // Success — done
+                    } catch (Exception e) {
+                        System.err.println("[ForceDLR] Direct send failed for msgId=" + msgId
+                                + ": " + e.getMessage() + " — will queue to DB");
+                    }
+                }
+
+                // PRIORITY 2: Fallback — queue to DB for other gateway's consumer
+                if (smsLogger != null) {
+                    smsLogger.logDlrWithQueue(msgId, dlrText, clientId, supplierId);
+                    System.out.println("[ForceDLR] Queued to DB for msgId=" + msgId
+                            + " status=" + status);
+                }
+            } catch (Exception e) {
+                System.err.println("[ForceDLR] Error for msgId=" + msgId + ": " + e.getMessage());
+            }
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    /** Build SMPP DLR text for a forced delivery receipt. */
+    private String buildDlrText(String msgId, String status) {
+        String smppStat = switch (status.toLowerCase()) {
+            case "delivered", "delivrd" -> "DELIVRD";
+            case "failed", "undeliv" -> "UNDELIV";
+            case "expired" -> "EXPIRED";
+            case "rejected", "rejctd" -> "REJECTD";
+            default -> "DELIVRD"; // default to delivered
+        };
+        String date = new java.text.SimpleDateFormat("yyMMddHHmm").format(new java.util.Date());
+        return "id:" + msgId
+                + " sub:001 dlvrd:001"
+                + " submit date:" + date
+                + " done date:" + date
+                + " stat:" + smppStat
+                + " err:000";
+    }
+
+    /**
+     * Parse DLR status from SMPP DLR short message text
+     * (e.g. "id:abc stat:DELIVRD err:000" → "DELIVRD").
+     */
+    private String parseDlrStatus(String dlrText) {
+        if (dlrText == null || dlrText.isEmpty()) return "";
+        Matcher m = DLR_STAT_PATTERN.matcher(dlrText);
+        return m.find() ? m.group(1).toUpperCase() : "";
+    }
+
+    /**
+     * Check whether a DLR status is a final delivery status.
+     * Intermediate statuses like ACCEPTD should not remove the session
+     * from pendingDlrs so the subsequent final DLR can still find it.
+     */
+    private boolean isFinalDlrStatus(String status) {
+        return switch (status) {
+            case "DELIVRD", "UNDELIV", "EXPIRED", "REJECTD", "DELETED" -> true;
+            default -> false;
+        };
     }
 
     public int getActiveSessionCount() {

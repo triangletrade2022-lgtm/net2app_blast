@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { invoices, smsLogs, clients, suppliers } from "@/db/schema";
+import { invoices, smsLogs, clients, suppliers, platformSettings } from "@/db/schema";
 import { eq, and, gte, lte, desc, sql } from "drizzle-orm";
 import { generateInvoiceNumber } from "@/lib/helpers";
 import { handleApiError } from "@/lib/api-error";
@@ -73,60 +73,124 @@ export async function POST(req: NextRequest) {
         statusFilter
       ));
 
-    // Get MCC-MNC breakdown (same status filter as total calculation)
-    const statusSql = billingType === "dlr"
-      ? sql`sl.status = 'delivered'`
-      : sql`sl.status IN ('submitted', 'delivered')`;
+    // Get destination-wise breakdown (grouped by MCC/country)
+    const entityIdCol = entityType === "client" ? "client_id" : "supplier_id";
+    const rateColName = entityType === "client" ? "client_rate" : "supplier_rate";
+    const statusSql2 = billingType === "dlr" ? "sl.status = 'delivered'" : "sl.status IN ('submitted', 'delivered')";
     const breakdown = await db.execute(sql`
       SELECT
         COALESCE(sl.mcc, '') as mcc,
-        COALESCE(sl.mnc, '') as mnc,
-        COALESCE(sl.mcc, '') || COALESCE(sl.mnc, '') as mcc_mnc,
         COUNT(*)::int as total_sms,
         COALESCE(SUM(sl.parts), 0)::int as total_parts,
-        CAST(${rateCol} as numeric) as rate,
-        SUM(CAST(${rateCol} as numeric) * sl.parts) as total
+        AVG(sl.${sql.raw(rateColName)}::numeric) as avg_rate,
+        SUM(sl.${sql.raw(rateColName)}::numeric * sl.parts) as total
       FROM ${smsLogs} sl
-      WHERE ${entityCol} = ${entityId}
+      WHERE sl.${sql.raw(entityIdCol)} = ${entityId}
         AND sl.created_at >= ${start}
         AND sl.created_at <= ${end}
-        AND ${statusSql}
-      GROUP BY sl.mcc, sl.mnc, ${rateCol}
+        AND ${sql.raw(statusSql2)}
+      GROUP BY sl.mcc
       ORDER BY total DESC NULLS LAST
     `);
 
-    // Format breakdown for JSON storage
+    // Format breakdown — each row is a destination (country) with aggregated stats
     const breakdownRows = Array.isArray(breakdown?.rows) ? breakdown.rows : [];
     const summary = breakdownRows.map((r: Record<string, unknown>) => {
       const mcc = String(r.mcc || '');
-      const mnc = String(r.mnc || '');
-      const mccMnc = mcc + mnc;
+      const country = countryMccMap[mcc] || 'Others';
       return {
-        mcc,
-        mnc,
-        mccMnc,
-        country: countryMccMap[mcc] || '',
-        operator: mccOperatorMap[mccMnc] || '',
+        destination: country,
+        mcc: mcc || '*',
         totalSms: Number(r.total_sms) || 0,
         totalParts: Number(r.total_parts) || 0,
-        rate: parseFloat(String(r.rate || '0')),
+        rate: parseFloat(String(r.avg_rate || '0')),
         total: parseFloat(String(r.total || '0')),
       };
     });
 
-    const invoiceData = { summary };
+    // Merge small countries into "Others" if more than 10 destinations
+    let mergedSummary = summary;
+    if (summary.length > 10) {
+      const top10 = summary.slice(0, 9);
+      const others = summary.slice(9);
+      const othersTotal = others.reduce((a, b) => a + b.total, 0);
+      const othersSms = others.reduce((a, b) => a + b.totalSms, 0);
+      top10.push({
+        destination: 'Others',
+        mcc: '*',
+        totalSms: othersSms,
+        totalParts: others.reduce((a, b) => a + b.totalParts, 0),
+        rate: othersSms > 0 ? othersTotal / othersSms : 0,
+        total: othersTotal,
+      });
+      mergedSummary = top10;
+    }
+
+    const invoiceData = { summary: mergedSummary };
+
+    // ── Generate sequential invoice number for this year ──
+    const yr = start.getFullYear();
+    const lastInvResult: any = await db.execute(sql`
+      SELECT MAX(invoice_number) as last_num FROM invoices
+      WHERE invoice_number LIKE ${`INV-${yr}-%`}
+    `);
+    let nextSeq = 1;
+    const lastRows = lastInvResult?.rows;
+    if (lastRows && lastRows.length > 0 && lastRows[0]?.last_num) {
+      const last = String(lastRows[0].last_num);
+      const parts = last.split('-');
+      if (parts.length === 3) {
+        nextSeq = parseInt(parts[2], 10) + 1;
+      }
+    }
+    const invoiceNumber = generateInvoiceNumber(nextSeq);
+
+    // ── Load platform settings for payment info, tax, and due date ──
+    const [platSettings] = await db.select().from(platformSettings).limit(1);
+
+    // ── Calculate invoice date, due date, tax ──
+    const invoiceDate = new Date();
+    const dueDate = new Date(invoiceDate);
+    const dueDays = platSettings?.invoiceDueDays || 30;
+    dueDate.setDate(dueDate.getDate() + dueDays);
+    const subtotal = parseFloat(usage[0]?.totalAmount || "0");
+    const taxRatePct = parseFloat(platSettings?.invoiceTaxRate || "19");
+    const taxRate = taxRatePct / 100;
+    const tax = Math.round(subtotal * taxRate * 100) / 100;
+    const total = Math.round((subtotal + tax) * 100) / 100;
 
     const [created] = await db.insert(invoices).values({
-      invoiceNumber: generateInvoiceNumber(),
+      invoiceNumber,
       entityType,
       entityId,
       entityName,
       periodStart: start,
       periodEnd: end,
       totalMessages: usage[0]?.totalMessages || 0,
-      totalAmount: usage[0]?.totalAmount || "0",
+      totalAmount: String(total),
+      currency: platSettings?.invoiceCurrency || "EUR",
       billingType: billingType || "submission",
-      invoiceData,  // drizzle handles JSON serialization
+      invoiceData: {
+        ...invoiceData,
+        invoiceDate: invoiceDate.toISOString(),
+        dueDate: dueDate.toISOString(),
+        subtotal: subtotal,
+        taxRate: parseFloat(platSettings?.invoiceTaxRate || "19") / 100,
+        tax: tax,
+        total: total,
+        paymentInfo: {
+          bank: platSettings?.paymentBank || "TBD",
+          account: platSettings?.paymentAccount || "TBD",
+          iban: platSettings?.paymentIban || "TBD",
+          swift: platSettings?.paymentSwift || "TBD",
+        },
+        invoiceBy: {
+          name: platSettings?.companyName || "NET2APP Hub",
+          type: "Platform Provider",
+          email: platSettings?.supportEmail || "support@net2app.com",
+          vat: platSettings?.vatNumber || "TBD",
+        },
+      },
       status: "draft",
     }).returning();
 

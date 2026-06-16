@@ -4,11 +4,39 @@ import { smsLogs, clients, suppliers, smppSessions, license, trunks, routes } fr
 import { eq, sql, gte } from "drizzle-orm";
 import { handleApiError } from "@/lib/api-error";
 
+/** Helper to produce time-window stats: sent count, failed count, cost, pay. */
+async function getTimeWindowStats(minutes: number) {
+  const since = new Date(Date.now() - minutes * 60 * 1000);
+  const rows = await db.select({
+    sent: sql<number>`count(*)::int`,
+    failed: sql<number>`sum(case when ${smsLogs.status} = 'failed' then 1 else 0 end)::int`,
+    cost: sql<string>`COALESCE(sum(cast(${smsLogs.cost} as numeric)), 0)::text`,
+    pay: sql<string>`COALESCE(sum(cast(${smsLogs.pay} as numeric)), 0)::text`,
+  }).from(smsLogs)
+    .where(gte(smsLogs.createdAt, since));
+  return rows[0];
+}
+
 export async function GET() {
   try {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
+    // ── Time-window summaries (parallel) ──
+    const windows = [1, 5, 15, 30, 60, 120, 240, 720, 1440];
+    const windowLabels = ["1m","5m","15m","30m","1h","2h","4h","12h","24h"];
+    const results = await Promise.all(windows.map(w => getTimeWindowStats(w)));
+    const timeWindows: Record<string, { sent: number; failed: number; cost: string; pay: string }> = {};
+    for (let i = 0; i < results.length; i++) {
+      timeWindows[windowLabels[i]] = {
+        sent: results[i].sent,
+        failed: results[i].failed,
+        cost: results[i].cost,
+        pay: results[i].pay,
+      };
+    }
+
+    // ── Legacy totals ──
     const [totalSms] = await db.select({ count: sql<number>`count(*)::int` }).from(smsLogs);
     const [todaySms] = await db.select({ count: sql<number>`count(*)::int` }).from(smsLogs)
       .where(gte(smsLogs.createdAt, today));
@@ -101,6 +129,7 @@ export async function GET() {
       recentSmpp,
       recentHttp,
       hourlyStats,
+      timeWindows,
     });
   } catch (e: unknown) {
     return handleApiError(e);

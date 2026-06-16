@@ -115,32 +115,31 @@ public class RouteResolver {
     }
 
     /**
-     * Check and deduct balance for client and supplier (only if billing_type = "on_submit").
-     * Checks BOTH balances first, then deducts both atomically to avoid partial charges.
-     * Returns true if both have sufficient balance/credit.
+     * Check balances for client and supplier (only if billing_type = "on_submit").
+     * Validates both have sufficient balance/credit WITHOUT deducting.
+     * Returns true if both have sufficient balance.
+     *
+     * Use this BEFORE sending to the supplier.
+     * Call deductAfterSuccess() AFTER the supplier confirms success.
      */
-    public boolean checkAndDeductBalance(int clientId, int supplierId,
-                                          double pay, double cost) {
+    public boolean checkBalance(int clientId, int supplierId,
+                                 double pay, double cost) {
         try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
-            // ── First pass: check both balances ──
-            double clientBal = 0, clientCred = 0;
-            boolean clientOnSubmit = false;
-            double supBal = 0, supCred = 0;
-            boolean supOnSubmit = false;
-
             // Check client
             String clientSql = "SELECT current_balance::numeric, credit_limit::numeric, billing_type FROM clients WHERE id = ?";
             try (PreparedStatement ps = conn.prepareStatement(clientSql)) {
                 ps.setInt(1, clientId);
                 ResultSet rs = ps.executeQuery();
                 if (rs.next()) {
-                    clientOnSubmit = "on_submit".equals(rs.getString("billing_type"));
-                    clientBal = toDouble(rs.getBigDecimal("current_balance"));
-                    clientCred = toDouble(rs.getBigDecimal("credit_limit"));
-                    if (clientOnSubmit && (clientBal + clientCred) < pay) {
-                        System.err.println("[RouteResolver] Client " + clientId
-                                + " insufficient: bal=" + clientBal + " + cred=" + clientCred + " < " + pay);
-                        return false;
+                    boolean clientOnSubmit = "on_submit".equals(rs.getString("billing_type"));
+                    if (clientOnSubmit) {
+                        double clientBal = toDouble(rs.getBigDecimal("current_balance"));
+                        double clientCred = toDouble(rs.getBigDecimal("credit_limit"));
+                        if ((clientBal + clientCred) < pay) {
+                            System.err.println("[RouteResolver] Client " + clientId
+                                    + " insufficient: bal=" + clientBal + " + cred=" + clientCred + " < " + pay);
+                            return false;
+                        }
                     }
                 }
             }
@@ -151,26 +150,82 @@ public class RouteResolver {
                 ps.setInt(1, supplierId);
                 ResultSet rs = ps.executeQuery();
                 if (rs.next()) {
-                    supOnSubmit = "on_submit".equals(rs.getString("billing_type"));
-                    supBal = toDouble(rs.getBigDecimal("current_balance"));
-                    supCred = toDouble(rs.getBigDecimal("credit_limit"));
-                    if (supOnSubmit && (supBal + supCred) < cost) {
-                        System.err.println("[RouteResolver] Supplier " + supplierId
-                                + " insufficient: bal=" + supBal + " + cred=" + supCred + " < " + cost);
-                        return false;
+                    boolean supOnSubmit = "on_submit".equals(rs.getString("billing_type"));
+                    if (supOnSubmit) {
+                        double supBal = toDouble(rs.getBigDecimal("current_balance"));
+                        double supCred = toDouble(rs.getBigDecimal("credit_limit"));
+                        if ((supBal + supCred) < cost) {
+                            System.err.println("[RouteResolver] Supplier " + supplierId
+                                    + " insufficient: bal=" + supBal + " + cred=" + supCred + " < " + cost);
+                            return false;
+                        }
                     }
                 }
             }
 
-            // ── Second pass: deduct both (both passed validation) ──
+            return true;
+        } catch (SQLException e) {
+            System.err.println("[RouteResolver] Balance check error: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Deduct balance for client and supplier AFTER a successful send.
+     * Only deducts for entities with billing_type = "on_submit".
+     * Call this ONLY after the supplier confirms successful submission.
+     */
+    public boolean deductAfterSuccess(int clientId, int supplierId,
+                                       double pay, double cost) {
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+            // Load current balances for both
+            double clientBal = 0, clientCred = 0;
+            boolean clientOnSubmit = false;
+            double supBal = 0, supCred = 0;
+            boolean supOnSubmit = false;
+
+            String clientSql = "SELECT current_balance::numeric, credit_limit::numeric, billing_type FROM clients WHERE id = ?";
+            try (PreparedStatement ps = conn.prepareStatement(clientSql)) {
+                ps.setInt(1, clientId);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    clientOnSubmit = "on_submit".equals(rs.getString("billing_type"));
+                    clientBal = toDouble(rs.getBigDecimal("current_balance"));
+                    clientCred = toDouble(rs.getBigDecimal("credit_limit"));
+                }
+            }
+
+            String supSql = "SELECT current_balance::numeric, credit_limit::numeric, billing_type FROM suppliers WHERE id = ?";
+            try (PreparedStatement ps = conn.prepareStatement(supSql)) {
+                ps.setInt(1, supplierId);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    supOnSubmit = "on_submit".equals(rs.getString("billing_type"));
+                    supBal = toDouble(rs.getBigDecimal("current_balance"));
+                    supCred = toDouble(rs.getBigDecimal("credit_limit"));
+                }
+            }
+
+            // Deduct both in same connection
             if (clientOnSubmit) deductBalance(conn, "clients", clientId, clientBal, clientCred, pay);
             if (supOnSubmit)   deductBalance(conn, "suppliers", supplierId, supBal, supCred, cost);
 
             return true;
         } catch (SQLException e) {
-            System.err.println("[RouteResolver] Balance error: " + e.getMessage());
+            System.err.println("[RouteResolver] Deduct error: " + e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Legacy method: check AND deduct in one call.
+     * Kept for backward compatibility but prefer using checkBalance() + deductAfterSuccess()
+     * to ensure failed sends don't charge the client.
+     */
+    public boolean checkAndDeductBalance(int clientId, int supplierId,
+                                          double pay, double cost) {
+        if (!checkBalance(clientId, supplierId, pay, cost)) return false;
+        return deductAfterSuccess(clientId, supplierId, pay, cost);
     }
 
     // ─── Helpers ───

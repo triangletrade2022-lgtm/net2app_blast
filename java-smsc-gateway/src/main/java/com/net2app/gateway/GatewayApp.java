@@ -1,6 +1,7 @@
 package com.net2app.gateway;
 
 import io.smppgateway.smpp.server.*;
+import java.time.Duration;
 
 /**
  * Main entry point for Net2App SMPP Gateway (Java 21 / smpp-core).
@@ -47,8 +48,11 @@ public class GatewayApp {
                 .port(smscPort)
                 .systemId("Net2App")
                 .handler(handler)
+                .bindTimeout(Duration.ofSeconds(10))
+                .requestTimeout(Duration.ofSeconds(30))
+                .useVirtualThreads(false)
                 .build();
-        server.start();
+        server.startSync();
         System.out.println("[SMSC] ESME server on port " + smscPort);
 
         Thread.currentThread().join();

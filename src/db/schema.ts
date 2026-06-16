@@ -475,6 +475,25 @@ export const apiProviders = pgTable("api_providers", {
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+// ─── Platform Settings ──────────────────────────────────
+export const platformSettings = pgTable("platform_settings", {
+  id: serial("id").primaryKey(),
+  companyName: varchar("company_name", { length: 255 }).default("NET2APP Hub"),
+  supportEmail: varchar("support_email", { length: 255 }).default("support@net2app.com"),
+  vatNumber: varchar("vat_number", { length: 50 }).default("TBD"),
+  // Invoice defaults
+  invoiceTaxRate: numeric("invoice_tax_rate", { precision: 5, scale: 2 }).default("19"),
+  invoiceDueDays: integer("invoice_due_days").default(30),
+  invoiceCurrency: varchar("invoice_currency", { length: 10 }).default("EUR"),
+  // Payment info
+  paymentBank: varchar("payment_bank", { length: 255 }).default("TBD"),
+  paymentAccount: varchar("payment_account", { length: 255 }).default("TBD"),
+  paymentIban: varchar("payment_iban", { length: 255 }).default("TBD"),
+  paymentSwift: varchar("payment_swift", { length: 255 }).default("TBD"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
 // ─── Activity Log ────────────────────────────────────────
 export const activityLog = pgTable("activity_log", {
   id: serial("id").primaryKey(),

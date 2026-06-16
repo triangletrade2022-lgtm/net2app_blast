@@ -14,11 +14,12 @@ interface RouteTrunk { id: number; routeId: number; trunkId: number; supplierId:
 interface SmsLog { id: number; messageId: string; clientId?: number; clientUser?: string; srcType?: string; supplierId?: number; supplierUser?: string; routeId?: number; routeName?: string; channel?: string; device?: string; sender?: string; recipient: string; messageText?: string; parts?: number; status: string; submitSuccess?: number; submitFail?: number; deliverSuccess?: number; deliverFail?: number; sendResult?: string; sendReason?: string; deliverResult?: string; deliverFailReason?: string; dlrStatus?: string; mcc?: string; mnc?: string; inMsgId?: string; outMsgId?: string; clientRate?: string; supplierRate?: string; cost?: string; pay?: string; profit?: string; sendTime?: string; deliverTime?: string; doneTime?: string; duration?: number; deliverDuration?: number; connectionType?: string; ipAddress?: string; clientName?: string; supplierName?: string; createdAt: string; }
 interface Invoice { id: number; invoiceNumber: string; entityType: string; entityId: number; entityName?: string; periodStart: string; periodEnd: string; totalMessages?: number; totalAmount?: string; status?: string; billingType?: string; createdAt: string; }
 interface SmppSession { id: number; entityType: string; entityId: number; systemId?: string; bindStatus?: string; bindType?: string; remoteAddress?: string; entityName?: string; lastActivity?: string; }
-interface DashboardData { totalSms: number; todaySms: number; deliveredSms: number; failedSms: number; submittedSms: number; totalClients: number; totalSuppliers: number; totalTrunks: number; totalRoutes: number; activeSessions: number; revenue: string; cost: string; profit: string; license: { maxVolume?: number; currentUsage?: number } | null; recentSmpp: SmsLog[]; recentHttp: SmsLog[]; hourlyStats: { hour: number; count: number }[]; }
+interface DashboardData { totalSms: number; todaySms: number; deliveredSms: number; failedSms: number; submittedSms: number; totalClients: number; totalSuppliers: number; totalTrunks: number; totalRoutes: number; activeSessions: number; revenue: string; cost: string; profit: string; license: { maxVolume?: number; currentUsage?: number } | null; recentSmpp: SmsLog[]; recentHttp: SmsLog[]; hourlyStats: { hour: number; count: number }[]; timeWindows: Record<string, { sent: number; failed: number; cost: string; pay: string }>; }
 interface SmtpData { host: string; port: number; secure: boolean; username: string; password: string; fromEmail: string; fromName: string; }
 interface ApiProvider { id: number; name: string; code?: string; apiUrl: string; apiMethod?: string; apiKeyParam?: string; apiKeyValue?: string; isActive: boolean; }
 interface BalanceEntry { id: number; name: string; email: string; currentBalance?: string; creditLimit?: string; totalSpent?: string; totalCost?: string; totalMessages?: number; billingType?: string; isActive: boolean; priority?: number; }
-type Tab = "dashboard" | "test-sms" | "campaign" | "clients" | "suppliers" | "rates" | "mccmnc" | "routes" | "trunks" | "route-trunks" | "logs" | "balance" | "invoices" | "reports" | "smpp" | "users" | "api-providers" | "smtp" | "license";
+interface PlatformSettings { id?: number; companyName?: string; supportEmail?: string; vatNumber?: string; invoiceTaxRate?: string; invoiceDueDays?: number; invoiceCurrency?: string; paymentBank?: string; paymentAccount?: string; paymentIban?: string; paymentSwift?: string; }
+type Tab = "dashboard" | "test-sms" | "campaign" | "clients" | "suppliers" | "rates" | "mccmnc" | "routes" | "trunks" | "route-trunks" | "logs" | "balance" | "invoices" | "reports" | "smpp" | "users" | "api-providers" | "smtp" | "license" | "platform";
 
 const api = async (url: string, opts?: RequestInit) => {
   const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
@@ -53,6 +54,7 @@ function Sidebar({ active, setActive, user, onLogout }: { active: Tab; setActive
     { key: "reports", label: "Reports", icon: "📈" }, { key: "smpp", label: "SMPP", icon: "⚡" },
     { key: "api-providers", label: "API Providers", icon: "🌐" }, { key: "users", label: "Users", icon: "🔑" },
     { key: "smtp", label: "SMTP", icon: "📧" }, { key: "license", label: "License", icon: "🛡️" },
+    { key: "platform", label: "Platform", icon: "⚙️" },
   ];
   return (<aside className="w-52 bg-gray-900 border-r border-gray-800 flex flex-col min-h-screen"><div className="p-3 border-b border-gray-800"><h1 className="text-base font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-cyan-400">Net2App Blast</h1></div><nav className="flex-1 p-1.5 space-y-0.5 overflow-y-auto">{items.filter(i=>!i.superOnly||user.role==="superuser").map(i=>(<button key={i.key} onClick={()=>setActive(i.key)} className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-xs transition ${active===i.key?"bg-blue-600/20 text-blue-400":"text-gray-400 hover:bg-gray-800"}`}><span>{i.icon}</span>{i.label}</button>))}</nav><div className="p-3 border-t border-gray-800 flex items-center gap-2"><div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${user.role==="superuser"?"bg-red-600":"bg-purple-600"}`}>{user.name[0]}</div><div className="flex-1 min-w-0"><p className="text-xs truncate">{user.name}</p><p className="text-[9px] text-gray-500">{user.role}</p></div><button onClick={onLogout} className="text-gray-400 hover:text-red-400 text-xs">⏻</button></div></aside>);
 }
@@ -70,7 +72,52 @@ function DashboardTab() {
   useEffect(()=>{const f=async()=>{const r=await api("/api/dashboard");if(!r.error)setD(r);};f();const i=setInterval(f,5000);return()=>clearInterval(i);},[]);
   if(!d) return <Spinner/>;
   const ss=[{l:"Total SMS",v:d.totalSms.toLocaleString(),i:"📨"},{l:"Today",v:d.todaySms.toLocaleString(),i:"📤"},{l:"Delivered",v:d.deliveredSms.toLocaleString(),i:"✅"},{l:"Failed",v:d.failedSms.toLocaleString(),i:"❌"},{l:"Clients",v:d.totalClients.toString(),i:"👥"},{l:"Suppliers",v:d.totalSuppliers.toString(),i:"🏢"},{l:"Routes",v:d.totalRoutes.toString(),i:"🔀"},{l:"Trunks",v:d.totalTrunks.toString(),i:"📡"}];
-  return (<div className="space-y-4"><div className="grid grid-cols-2 md:grid-cols-4 gap-2">{ss.map(s=>(<div key={s.l} className="bg-gray-900 border border-gray-800 rounded-xl p-3"><div className="flex justify-between mb-1"><span className="text-lg">{s.i}</span><span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-600 text-white">Live</span></div><p className="text-lg font-bold">{s.v}</p><p className="text-[10px] text-gray-500">{s.l}</p></div>))}</div><div className="grid grid-cols-1 md:grid-cols-4 gap-2"><div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">DLR Rate</p><p className="text-2xl font-black text-green-400">{d.totalSms>0?((d.deliveredSms/d.totalSms)*100).toFixed(1):"0"}%</p></div><div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">Sessions</p><p className="text-2xl font-black text-blue-400">{d.activeSessions}</p></div><div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">Revenue</p><p className="text-lg font-bold text-green-400">${parseFloat(d.revenue).toFixed(4)}</p></div><div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">Profit</p><p className="text-lg font-bold text-yellow-400">${parseFloat(d.profit).toFixed(4)}</p></div></div><div className="grid grid-cols-1 lg:grid-cols-2 gap-3">{[["🔗 SMPP",d.recentSmpp,"blue"],["🌐 HTTP",d.recentHttp,"cyan"]].map(([t,logs,clr])=>(<div key={t as string} className="bg-gray-900 border border-gray-800 rounded-xl p-3"><h3 className="text-xs font-semibold text-gray-300 mb-2">{t as string}</h3><table className="w-full text-[10px]"><thead><tr className="text-gray-500 border-b border-gray-800"><th className="pb-1">ID</th><th className="pb-1">Client</th><th className="pb-1">To</th><th className="pb-1">Status</th></tr></thead><tbody>{(logs as SmsLog[]).length===0?<tr><td colSpan={4} className="py-4 text-center text-gray-600">-</td></tr>:(logs as SmsLog[]).map((l:SmsLog)=>(<tr key={l.id} className="border-b border-gray-800/50">           <td className={`py-1 font-mono text-${clr}-400`}>{l.id}</td><td className="py-1">{l.clientUser||"-"}</td><td className="py-1">{l.recipient}</td><td className="py-1"><Badge s={l.status}/></td></tr>))}</tbody></table></div>))}</div></div>);
+  const twKeys = d.timeWindows ? Object.keys(d.timeWindows) : [];
+  return (<div className="space-y-4">
+    {/* Top stat cards */}
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">{ss.map(s=>(<div key={s.l} className="bg-gray-900 border border-gray-800 rounded-xl p-3"><div className="flex justify-between mb-1"><span className="text-lg">{s.i}</span><span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-600 text-white">Live</span></div><p className="text-lg font-bold">{s.v}</p><p className="text-[10px] text-gray-500">{s.l}</p></div>))}</div>
+
+    {/* Time-window summary rows */}
+    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
+      <div className="p-2 border-b border-gray-800 flex items-center gap-2">
+        <span className="text-xs font-semibold text-gray-300">⏱ Time Summary</span>
+        <span className="text-[9px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Auto-refresh 5s</span>
+      </div>
+      <table className="w-full text-[10px]">
+        <thead><tr className="text-gray-500 border-b border-gray-800">
+          <th className="p-2 text-left">Period</th>
+          <th className="p-2 text-right">Sent</th>
+          <th className="p-2 text-right">Failed</th>
+          <th className="p-2 text-right">Cost</th>
+          <th className="p-2 text-right">Pay</th>
+          <th className="p-2 text-right">Success %</th>
+        </tr></thead>
+        <tbody>{twKeys.map(k=>{
+          const w = d.timeWindows![k];
+          const pct = w.sent > 0 ? ((w.sent - w.failed) / w.sent * 100).toFixed(1) : "-";
+          return (<tr key={k} className="border-b border-gray-800/30 hover:bg-gray-800/30">
+            <td className="p-2 font-semibold text-blue-400">{k}</td>
+            <td className="p-2 text-right">{(w.sent ?? 0).toLocaleString()}</td>
+            <td className={`p-2 text-right ${(w.failed ?? 0) > 0 ? 'text-red-400' : 'text-gray-400'}`}>{(w.failed ?? 0).toLocaleString()}</td>
+            <td className="p-2 text-right text-red-400">${parseFloat(w.cost || "0").toFixed(4)}</td>
+            <td className="p-2 text-right text-green-400">${parseFloat(w.pay || "0").toFixed(4)}</td>
+            <td className={`p-2 text-right font-bold ${parseFloat(pct) >= 95 ? 'text-green-400' : parseFloat(pct) >= 80 ? 'text-yellow-400' : 'text-red-400'}`}>{pct}{pct !== "-" ? "%" : ""}</td>
+          </tr>);
+        })}</tbody>
+      </table>
+    </div>
+
+    {/* KPI cards */}
+    <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">DLR Rate</p><p className="text-2xl font-black text-green-400">{d.totalSms>0?((d.deliveredSms/d.totalSms)*100).toFixed(1):"0"}%</p></div>
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">Sessions</p><p className="text-2xl font-black text-blue-400">{d.activeSessions}</p></div>
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">Revenue</p><p className="text-lg font-bold text-green-400">${parseFloat(d.revenue).toFixed(4)}</p></div>
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">Profit</p><p className="text-lg font-bold text-yellow-400">${parseFloat(d.profit).toFixed(4)}</p></div>
+    </div>
+
+    {/* Recent logs */}
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">{[["🔗 SMPP",d.recentSmpp,"blue"],["🌐 HTTP",d.recentHttp,"cyan"]].map(([t,logs,clr])=>(<div key={t as string} className="bg-gray-900 border border-gray-800 rounded-xl p-3"><h3 className="text-xs font-semibold text-gray-300 mb-2">{t as string}</h3><table className="w-full text-[10px]"><thead><tr className="text-gray-500 border-b border-gray-800"><th className="pb-1">ID</th><th className="pb-1">Client</th><th className="pb-1">To</th><th className="pb-1">Status</th></tr></thead><tbody>{(logs as SmsLog[]).length===0?<tr><td colSpan={4} className="py-4 text-center text-gray-600">-</td></tr>:(logs as SmsLog[]).map((l:SmsLog)=>(<tr key={l.id} className="border-b border-gray-800/50">           <td className={`py-1 font-mono text-${clr}-400`}>{l.id}</td><td className="py-1">{l.clientUser||"-"}</td><td className="py-1">{l.recipient}</td><td className="py-1"><Badge s={l.status}/></td></tr>))}</tbody></table></div>))}</div>
+  </div>);
 }
 
 // ── Clients Tab (FIXED - form visible) ─────────────────
@@ -371,14 +418,14 @@ function RouteTrunksTab() {
 
 // ── SMS Logs Tab ──────────────────────────────────────
 function LogsTab() {
-  const [logs,setLogs]=useState<SmsLog[]>([]);const [filter,setFilter]=useState("all");const [sel,setSel]=useState<SmsLog|null>(null);
-  useEffect(()=>{const l=async()=>{const d=await api(`/api/sms/logs?limit=500${filter!=="all"?`&connectionType=${filter}`:""}`);if(Array.isArray(d))setLogs(d);};l();const i=setInterval(l,2000);return()=>clearInterval(i);},[filter]);
+  const [logs,setLogs]=useState<SmsLog[]>([]);const [filter,setFilter]=useState("all");const [sel,setSel]=useState<SmsLog|null>(null);const [sq,setSq]=useState("");
+  useEffect(()=>{const l=async()=>{const q=sq.trim();const params=new URLSearchParams({limit:"500"});if(filter!=="all")params.set("connectionType",filter);if(q)params.set("search",q);const d=await api(`/api/sms/logs?${params}`);if(Array.isArray(d))setLogs(d);};l();const i=setInterval(l,2000);return()=>clearInterval(i);},[filter,sq]);
   const srColor = (v?: string) => {
     if (!v) return "text-gray-500";
     const ok = ["success","delivered","sent","0"].includes(v.toLowerCase());
     return ok ? "text-green-400 font-medium" : "text-red-400 font-medium";
   };
-  return (<div className="space-y-3"><div className="flex justify-between items-center"><h2 className="text-lg font-bold">📋 SMS Logs</h2><div className="flex items-center gap-3"><span className="text-[10px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Live</span><div className="flex gap-1">{(["all","http","smpp","test"]as const).map(f=>(<button key={f} onClick={()=>setFilter(f)} className={`px-2.5 py-1 rounded text-xs ${filter===f?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>{f.toUpperCase()}</button>))}</div></div></div>{sel&&(<div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={()=>setSel(null)}><div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-3xl w-full max-h-[85vh] overflow-y-auto" onClick={e=>e.stopPropagation()}><div className="flex justify-between mb-4"><h3 className="text-lg font-bold">SMS ID: {sel.id}</h3><button onClick={()=>setSel(null)} className="text-gray-400 hover:text-white text-2xl">&times;</button></div><div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs">{[["MessageID",sel.messageId],["Client",sel.clientUser],["Alias",sel.clientName],["Src Type",sel.srcType],["Route",sel.routeName],["Channel",sel.channel],["Device",sel.device],["Sender",sel.sender],["Recipient",sel.recipient],["Submit S/F",`${sel.submitSuccess}/${sel.submitFail}`],["Deliver S/F",`${sel.deliverSuccess}/${sel.deliverFail}`],["Send Result",sel.sendResult,"srColor"],["Deliver Result",sel.deliverResult,"srColor"],["DLR Status",sel.dlrStatus],["MCC",sel.mcc],["MNC",sel.mnc],["Cost",sel.cost],["Pay",sel.pay],["Profit",sel.profit],["Supplier",sel.supplierUser],["In MsgID",sel.inMsgId],["Out MsgID",sel.outMsgId],["IP",sel.ipAddress],["Time",new Date(sel.createdAt).toLocaleString()]].map(([k,v,clr])=>(<div key={k} className="bg-gray-800 p-2 rounded"><span className="text-gray-500">{k}:</span><br/><span className={clr==="srColor"?srColor(v):""}>{v||"-"}</span></div>))}<div className="bg-gray-800 p-2 rounded md:col-span-3"><span className="text-gray-500">Content:</span><br/>{sel.messageText||"-"}</div></div></div></div>)}<div className="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto"><table className="w-full text-[10px]"><thead><tr className="text-gray-500 border-b border-gray-800 text-left"><th className="p-2">ID</th><th className="p-2">Client</th><th className="p-2">Type</th><th className="p-2">Route</th><th className="p-2">Sender</th><th className="p-2">Recipient</th><th className="p-2">Status</th><th className="p-2">Send</th><th className="p-2">Deliver</th><th className="p-2">Cost</th><th className="p-2">Pay</th><th className="p-2">Time</th></tr></thead><tbody>{logs.length===0?<tr><td colSpan={12} className="p-6 text-center text-gray-600">No logs</td></tr>:logs.map(l=>(<tr key={l.id} className="border-b border-gray-800/50 hover:bg-gray-800/30 cursor-pointer" onClick={()=>setSel(l)}><td className="p-2 font-mono text-blue-400">{l.id}</td><td className="p-2">{l.clientUser||"-"}</td><td className="p-2"><span className={`px-1 py-0.5 rounded text-[9px] ${l.srcType==="SMPP"?"bg-purple-500/20 text-purple-400":l.srcType==="TEST"?"bg-yellow-500/20 text-yellow-400":"bg-cyan-500/20 text-cyan-400"}`}>{l.srcType||"HTTP"}</span></td><td className="p-2">{l.routeName||"-"}</td><td className="p-2">{l.sender}</td><td className="p-2">{l.recipient}</td><td className="p-2"><Badge s={l.status}/></td><td className={`p-2 ${srColor(l.sendResult)}`}>{l.sendResult||"-"}</td><td className={`p-2 ${srColor(l.deliverResult)}`}>{l.deliverResult||"-"}</td><td className="p-2 text-red-400">${l.cost||"0"}</td><td className="p-2 text-green-400">${l.pay||"0"}</td><td className="p-2 text-gray-500">{new Date(l.createdAt).toLocaleTimeString()}</td></tr>))}</tbody></table></div></div>);
+  return (<div className="space-y-3"><div className="flex justify-between items-center"><h2 className="text-lg font-bold">📋 SMS Logs</h2><div className="flex items-center gap-3"><input type="text" value={sq} onChange={e=>setSq(e.target.value)} placeholder="🔍 Search by phone, ID, content..." className="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none w-56"/><span className="text-[10px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Live</span><div className="flex gap-1">{(["all","http","smpp","test"]as const).map(f=>(<button key={f} onClick={()=>setFilter(f)} className={`px-2.5 py-1 rounded text-xs ${filter===f?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>{f.toUpperCase()}</button>))}</div></div></div>{sel&&(<div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={()=>setSel(null)}><div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-3xl w-full max-h-[85vh] overflow-y-auto" onClick={e=>e.stopPropagation()}><div className="flex justify-between mb-4"><h3 className="text-lg font-bold">SMS ID: {sel.id}</h3><button onClick={()=>setSel(null)} className="text-gray-400 hover:text-white text-2xl">&times;</button></div><div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs">{[["MessageID",sel.messageId],["Client",sel.clientUser],["Alias",sel.clientName],["Src Type",sel.srcType],["Route",sel.routeName],["Channel",sel.channel],["Device",sel.device],["Sender",sel.sender],["Recipient",sel.recipient],["Submit S/F",`${sel.submitSuccess}/${sel.submitFail}`],["Deliver S/F",`${sel.deliverSuccess}/${sel.deliverFail}`],["Send Result",sel.sendResult,"srColor"],["Deliver Result",sel.deliverResult,"srColor"],["DLR Status",sel.dlrStatus],["MCC",sel.mcc],["MNC",sel.mnc],["Cost",sel.cost],["Pay",sel.pay],["Profit",sel.profit],["Supplier",sel.supplierUser],["In MsgID",sel.inMsgId],["Out MsgID",sel.outMsgId],["IP",sel.ipAddress],["Time",new Date(sel.createdAt).toLocaleString()]].map(([k,v,clr])=>(<div key={k} className="bg-gray-800 p-2 rounded"><span className="text-gray-500">{k}:</span><br/><span className={clr==="srColor"?srColor(v):""}>{v||"-"}</span></div>))}<div className="bg-gray-800 p-2 rounded md:col-span-3"><span className="text-gray-500">Content:</span><br/>{sel.messageText||"-"}</div></div></div></div>)}<div className="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto"><table className="w-full text-[10px]"><thead><tr className="text-gray-500 border-b border-gray-800 text-left"><th className="p-2">ID</th><th className="p-2">Client</th><th className="p-2">Type</th><th className="p-2">Route</th><th className="p-2">Sender</th><th className="p-2">Recipient</th><th className="p-2">Status</th><th className="p-2">Send</th><th className="p-2">Deliver</th><th className="p-2">Cost</th><th className="p-2">Pay</th><th className="p-2">Time</th></tr></thead><tbody>{logs.length===0?<tr><td colSpan={12} className="p-6 text-center text-gray-600">No logs</td></tr>:logs.map(l=>(<tr key={l.id} className="border-b border-gray-800/50 hover:bg-gray-800/30 cursor-pointer" onClick={()=>setSel(l)}><td className="p-2 font-mono text-blue-400">{l.id}</td><td className="p-2">{l.clientUser||"-"}</td><td className="p-2"><span className={`px-1 py-0.5 rounded text-[9px] ${l.srcType==="SMPP"?"bg-purple-500/20 text-purple-400":l.srcType==="TEST"?"bg-yellow-500/20 text-yellow-400":"bg-cyan-500/20 text-cyan-400"}`}>{l.srcType||"HTTP"}</span></td><td className="p-2">{l.routeName||"-"}</td><td className="p-2">{l.sender}</td><td className="p-2">{l.recipient}</td><td className="p-2"><Badge s={l.status}/></td><td className={`p-2 ${srColor(l.sendResult)}`}>{l.sendResult||"-"}</td><td className={`p-2 ${srColor(l.deliverResult)}`}>{l.deliverResult||"-"}</td><td className="p-2 text-red-400">${l.cost||"0"}</td><td className="p-2 text-green-400">${l.pay||"0"}</td><td className="p-2 text-gray-500">{new Date(l.createdAt).toLocaleTimeString()}</td></tr>))}</tbody></table></div></div>);
 }
 
 function SmppTab() {
@@ -413,6 +460,140 @@ function SmtpTab() {
   useEffect(()=>{const l=async()=>{const d=await api("/api/smtp");if(d&&!d.error){setSmtp(d);setF(d);}};l();},[]);
   const sub=async(e:React.FormEvent)=>{e.preventDefault();await api("/api/smtp",{method:"POST",body:JSON.stringify(f)});const d=await api("/api/smtp");if(d&&!d.error)setSmtp(d);alert("SMTP saved!");};
   return (<div className="space-y-3"><h2 className="text-lg font-bold">📧 SMTP Config</h2><form onSubmit={sub} className="bg-gray-900 border border-gray-800 rounded-xl p-4 grid grid-cols-1 md:grid-cols-2 gap-3 max-w-2xl"><div><label className="text-[10px] text-gray-500">Host</label><input required value={f.host} onChange={e=>setF({...f,host:e.target.value})} className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/></div><div><label className="text-[10px] text-gray-500">Port</label><input required type="number" value={f.port} onChange={e=>setF({...f,port:parseInt(e.target.value)})} className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/></div><div><label className="text-[10px] text-gray-500">Username</label><input required value={f.username} onChange={e=>setF({...f,username:e.target.value})} className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/></div><div><label className="text-[10px] text-gray-500">Password</label><input required type="password" value={f.password} onChange={e=>setF({...f,password:e.target.value})} className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/></div><div><label className="text-[10px] text-gray-500">From Email</label><input required type="email" value={f.fromEmail} onChange={e=>setF({...f,fromEmail:e.target.value})} className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/></div><div><label className="text-[10px] text-gray-500">From Name</label><input value={f.fromName} onChange={e=>setF({...f,fromName:e.target.value})} className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/></div><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={f.secure} onChange={e=>setF({...f,secure:e.target.checked})}/>TLS</label><button type="submit" className="px-4 py-2 bg-green-600 text-white rounded text-xs">Save SMTP</button></form>{smtp&&<div className="bg-gray-900 border border-gray-800 rounded-xl p-3 max-w-2xl text-xs text-gray-400">Host: {smtp.host}:{smtp.port} | From: {smtp.fromName} | TLS: {smtp.secure?"Yes":"No"}</div>}</div>);
+}
+
+// ── Platform Settings Tab ───────────────────────────
+function PlatformTab() {
+  const [settings, setSettings] = useState<PlatformSettings | null>(null);
+  const [f, setF] = useState<PlatformSettings>({
+    companyName: "NET2APP Hub",
+    supportEmail: "support@net2app.com",
+    vatNumber: "TBD",
+    invoiceTaxRate: "19",
+    invoiceDueDays: 30,
+    invoiceCurrency: "EUR",
+    paymentBank: "TBD",
+    paymentAccount: "TBD",
+    paymentIban: "TBD",
+    paymentSwift: "TBD",
+  });
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => {
+    const load = async () => {
+      const d = await api("/api/platform-settings");
+      if (d && !d.error) {
+        setSettings(d);
+        setF(d);
+      }
+    };
+    load();
+  }, []);
+
+  const sub = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    setMsg("");
+    const res = await api("/api/platform-settings", {
+      method: "PUT",
+      body: JSON.stringify(f),
+    });
+    if (res && !res.error) {
+      setSettings(res);
+      setMsg("✅ Platform settings saved!");
+    } else {
+      setMsg("❌ " + (res.error || "Failed to save"));
+    }
+    setSaving(false);
+  };
+
+  return (
+    <div className="space-y-3">
+      <h2 className="text-lg font-bold">⚙️ Platform Settings</h2>
+      <p className="text-xs text-gray-500">These settings are used on invoices and platform communications.</p>
+
+      <form onSubmit={sub} className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-5 max-w-2xl">
+        {/* Company Info */}
+        <div>
+          <h3 className="text-sm font-semibold text-gray-300 mb-3">Company Information</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div><label className="text-[10px] text-gray-500">Company Name</label>
+              <input value={f.companyName || ""} onChange={e => setF({ ...f, companyName: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none" /></div>
+            <div><label className="text-[10px] text-gray-500">Support Email</label>
+              <input type="email" value={f.supportEmail || ""} onChange={e => setF({ ...f, supportEmail: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none" /></div>
+            <div><label className="text-[10px] text-gray-500">VAT Number</label>
+              <input value={f.vatNumber || ""} onChange={e => setF({ ...f, vatNumber: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none" /></div>
+          </div>
+        </div>
+
+        {/* Invoice Defaults */}
+        <div>
+          <h3 className="text-sm font-semibold text-gray-300 mb-3">Invoice Defaults</h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div><label className="text-[10px] text-gray-500">Tax Rate (%)</label>
+              <input value={f.invoiceTaxRate || ""} onChange={e => setF({ ...f, invoiceTaxRate: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white" /></div>
+            <div><label className="text-[10px] text-gray-500">Due Days</label>
+              <input type="number" value={f.invoiceDueDays || 30} onChange={e => setF({ ...f, invoiceDueDays: parseInt(e.target.value) || 30 })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white" /></div>
+            <div><label className="text-[10px] text-gray-500">Currency</label>
+              <select value={f.invoiceCurrency || "EUR"} onChange={e => setF({ ...f, invoiceCurrency: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white">
+                <option>EUR</option><option>USD</option><option>GBP</option><option>BDT</option>
+              </select></div>
+          </div>
+        </div>
+
+        {/* Payment Information */}
+        <div>
+          <h3 className="text-sm font-semibold text-gray-300 mb-3">Payment Information</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div><label className="text-[10px] text-gray-500">Bank Name</label>
+              <input value={f.paymentBank || ""} onChange={e => setF({ ...f, paymentBank: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none" /></div>
+            <div><label className="text-[10px] text-gray-500">Account Name / Number</label>
+              <input value={f.paymentAccount || ""} onChange={e => setF({ ...f, paymentAccount: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none" /></div>
+            <div><label className="text-[10px] text-gray-500">IBAN</label>
+              <input value={f.paymentIban || ""} onChange={e => setF({ ...f, paymentIban: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none" /></div>
+            <div><label className="text-[10px] text-gray-500">BIC / SWIFT</label>
+              <input value={f.paymentSwift || ""} onChange={e => setF({ ...f, paymentSwift: e.target.value })}
+                className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none" /></div>
+          </div>
+        </div>
+
+        <div className="pt-2 border-t border-gray-800 flex items-center gap-3">
+          <button type="submit" disabled={saving}
+            className="px-6 py-2 bg-green-600 text-white rounded text-xs font-semibold hover:bg-green-500 disabled:opacity-50">
+            {saving ? "Saving..." : "💾 Save Platform Settings"}
+          </button>
+          {msg && <span className="text-xs text-green-400">{msg}</span>}
+        </div>
+      </form>
+
+      {/* Current settings summary */}
+      {settings && (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 max-w-2xl space-y-2 text-xs">
+          <h3 className="text-xs font-semibold text-gray-400 mb-1">Current Configuration</h3>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            <div><span className="text-gray-500">Company:</span> <span className="text-gray-300">{settings.companyName}</span></div>
+            <div><span className="text-gray-500">Email:</span> <span className="text-gray-300">{settings.supportEmail}</span></div>
+            <div><span className="text-gray-500">Tax:</span> <span className="text-gray-300">{settings.invoiceTaxRate}%</span></div>
+            <div><span className="text-gray-500">Currency:</span> <span className="text-gray-300">{settings.invoiceCurrency}</span></div>
+            <div><span className="text-gray-500">Bank:</span> <span className="text-gray-300">{settings.paymentBank}</span></div>
+            <div><span className="text-gray-500">IBAN:</span> <span className="font-mono text-gray-300">{settings.paymentIban}</span></div>
+            <div><span className="text-gray-500">BIC:</span> <span className="font-mono text-gray-300">{settings.paymentSwift}</span></div>
+            <div><span className="text-gray-500">VAT:</span> <span className="text-gray-300">{settings.vatNumber}</span></div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function LicenseTab() {
@@ -756,7 +937,7 @@ export default function Home() {
     case"routes":return<RoutesTab/>;case"trunks":return<TrunksTab/>;case"route-trunks":return<RouteTrunksTab/>;
     case"logs":return<LogsTab/>;case"balance":return<BalanceTab/>;case"invoices":return<InvoicesTab/>;
     case"reports":return<ReportsTab/>;case"smpp":return<SmppTab/>;case"users":return<UsersTab currentUser={user}/>;
-    case"api-providers":return<ApiProvidersTab/>;case"smtp":return<SmtpTab/>;case"license":return<LicenseTab/>;
+    case"api-providers":return<ApiProvidersTab/>;case"smtp":return<SmtpTab/>;case"license":return<LicenseTab/>;case"platform":return<PlatformTab/>;
   }};
 
   return (<div className="flex min-h-screen bg-gray-950"><Sidebar active={tab} setActive={setTab} user={user} onLogout={()=>{localStorage.removeItem("token");setUser(null);}}/><main className="flex-1 p-4 overflow-y-auto"><div className="mb-3 flex justify-between items-center"><div><h1 className="text-lg font-bold capitalize">{tab.replace("-"," ")}</h1><p className="text-[10px] text-gray-500">Net2App Blast v2.1</p></div><span className="flex items-center gap-1.5 text-xs text-green-400"><span className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>Online</span></div>{render()}</main></div>);

@@ -2,159 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { invoices, smtpConfig } from "@/db/schema";
 import { eq } from "drizzle-orm";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { generateInvoicePdf, type PdfInvoiceInput } from "@/lib/invoice-pdf";
 import nodemailer from "nodemailer";
 import { handleApiError } from "@/lib/api-error";
-
-const countryMccMap: Record<string, string> = {
-  "470": "Bangladesh", "404": "India", "310": "United States",
-  "234": "United Kingdom", "410": "Pakistan", "502": "Malaysia",
-  "510": "Indonesia", "420": "Saudi Arabia", "424": "UAE",
-  "621": "Nigeria", "655": "South Africa", "262": "Germany",
-  "208": "France", "724": "Brazil", "515": "Philippines",
-  "636": "Ethiopia",
-};
-
-const mccOperatorMap: Record<string, string> = {
-  "47001": "Grameenphone", "47003": "Banglalink", "47002": "Robi", "47007": "Airtel", "47004": "Teletalk",
-  "40468": "Jio", "40410": "Airtel", "40420": "Vodafone Idea", "40459": "BSNL",
-  "310410": "AT&T", "310260": "T-Mobile", "310012": "Verizon",
-  "23430": "EE", "23410": "O2", "23415": "Vodafone", "23420": "Three",
-  "41001": "Jazz", "41004": "Zong", "41006": "Telenor", "41003": "Ufone",
-  "63601": "Ethio Telecom", "63602": "Safaricom Ethiopia",
-};
-
-async function generateInvoicePdf(inv: Record<string, unknown>, summary: any[]): Promise<Buffer> {
-  const doc = await PDFDocument.create();
-  const font = await doc.embedFont(StandardFonts.Helvetica);
-  const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
-  let page = doc.addPage([612, 792]);
-  const { width } = page.getSize();
-  const pageH = 792;
-  let y = pageH - 50;
-  const margin = 50;
-  const colW = (width - 2 * margin) / 7;
-  const accent = rgb(0.15, 0.35, 0.85);
-  const dark = rgb(0.15, 0.15, 0.15);
-  const gray = rgb(0.45, 0.45, 0.45);
-  const lightBg = rgb(0.95, 0.97, 1);
-  const colWidths = [colW, colW * 1.5, colW * 1.5, colW * 0.8, colW * 0.8, colW * 0.7, colW * 0.7];
-
-  function drawTableHeader(p: typeof page) {
-    p.drawRectangle({ x: margin, y: y - 3, width: width - 2 * margin, height: 16, color: accent });
-    let hx = margin;
-    const hdrs = ["MCC-MNC", "Country", "Operator", "SMS", "Parts", "Rate", "Total"];
-    for (let i = 0; i < hdrs.length; i++) {
-      const w = colWidths[i];
-      if (i >= 3) {
-        p.drawText(hdrs[i], { x: hx + w - 8, y, size: 8, font: fontBold, color: rgb(1, 1, 1) });
-      } else {
-        p.drawText(hdrs[i], { x: hx + 4, y, size: 8, font: fontBold, color: rgb(1, 1, 1) });
-      }
-      hx += w;
-    }
-  }
-
-  function addContinuedPage() {
-    page = doc.addPage([612, 792]);
-    y = page.getSize().height - 50;
-    page.drawText(`Invoice ${inv.invoiceNumber} (continued)`, { x: margin, y, size: 12, font: fontBold, color: accent });
-    y -= 20;
-    page.drawLine({ start: { x: margin, y }, end: { x: width - margin, y }, thickness: 0.5, color: gray });
-    y -= 16;
-    drawTableHeader(page);
-    y -= 18;
-  }
-
-  // Header
-  page.drawText("INVOICE", { x: margin, y, size: 28, font: fontBold, color: accent });
-  y -= 8;
-  page.drawText(String(inv.invoiceNumber || ""), { x: margin, y, size: 14, font, color: dark });
-  y -= 25;
-  page.drawLine({ start: { x: margin, y }, end: { x: width - margin, y }, thickness: 1.5, color: accent });
-  y -= 20;
-
-  const entityLabel = inv.entityType === "client" ? "Client" : "Supplier";
-  const infoRows = [
-    { label: "Entity", value: `${entityLabel}: ${inv.entityName || "N/A"}` },
-    { label: "Period", value: `${new Date(inv.periodStart as string).toLocaleDateString()} — ${new Date(inv.periodEnd as string).toLocaleDateString()}` },
-    { label: "Status", value: ((inv.status as string) || "draft").toUpperCase() },
-    { label: "Billing", value: inv.billingType === "dlr" ? "On DLR (Delivered Only)" : "On Submit" },
-    { label: "Total SMS", value: ((inv.totalMessages as number) || 0).toLocaleString() },
-    { label: "Total Amount", value: `$${parseFloat(String(inv.totalAmount || "0")).toFixed(4)}` },
-  ];
-  for (const row of infoRows) {
-    page.drawText(row.label, { x: margin, y, size: 9, font: fontBold, color: gray });
-    page.drawText(row.value, { x: margin + 80, y, size: 9, font, color: dark });
-    y -= 14;
-  }
-  y -= 10;
-
-  // Table
-  if (summary.length > 0) {
-    page.drawLine({ start: { x: margin, y }, end: { x: width - margin, y }, thickness: 0.5, color: gray });
-    y -= 12;
-    drawTableHeader(page);
-    y -= 18;
-
-    const rowH = 16;
-    for (let i = 0; i < summary.length; i++) {
-      const b = summary[i];
-      if (y < 80) addContinuedPage();
-      if (i % 2 === 0) {
-        page.drawRectangle({ x: margin, y: y - 2, width: width - 2 * margin, height: rowH, color: lightBg });
-      }
-      let hx = margin;
-      const rowData = [
-        b.mccMnc || "N/A", b.country || "-", b.operator || "-",
-        b.totalSms?.toLocaleString() || "0", b.totalParts?.toLocaleString() || "0",
-        `$${(b.rate || 0).toFixed(6)}`, `$${(b.total || 0).toFixed(4)}`,
-      ];
-      for (let j = 0; j < rowData.length; j++) {
-        const w = colWidths[j];
-        if (j >= 3) {
-          page.drawText(rowData[j], { x: hx + w - 8, y: y + 2, size: 8, font, color: dark });
-        } else {
-          page.drawText(rowData[j], { x: hx + 4, y: y + 2, size: 8, font, color: j === 0 ? accent : dark });
-        }
-        hx += w;
-      }
-      y -= rowH;
-    }
-
-    y -= 6;
-    page.drawLine({ start: { x: margin, y }, end: { x: width - margin, y }, thickness: 1, color: accent });
-    y -= 16;
-
-    const totSms = summary.reduce((a: number, b: any) => a + (b.totalSms || 0), 0);
-    const totAmount = summary.reduce((a: number, b: any) => a + (b.total || 0), 0);
-
-    drawTableHeader(page);
-    y -= 18;
-    let hx = margin;
-    const totData = ["", "", "", totSms.toLocaleString(), "", "", `$${totAmount.toFixed(4)}`];
-    for (let j = 0; j < totData.length; j++) {
-      const w = colWidths[j];
-      if (totData[j]) {
-        page.drawText(totData[j], { x: hx + w - 8, y: y + 2, size: 9, font: fontBold, color: accent });
-      }
-      hx += w;
-    }
-    y -= rowH + 6;
-
-    page.drawText("GRAND TOTAL", { x: margin, y, size: 12, font: fontBold, color: accent });
-    page.drawText(`$${totAmount.toFixed(4)}`, { x: width - margin - 100, y, size: 12, font: fontBold, color: accent });
-  }
-
-  // Footer
-  y = 40;
-  page.drawLine({ start: { x: margin, y }, end: { x: width - margin, y }, thickness: 0.5, color: gray });
-  y -= 14;
-  page.drawText("Net2App Blast — Enterprise SMS Gateway", { x: margin, y, size: 7, font, color: gray });
-  page.drawText(`Generated: ${new Date().toLocaleString()}`, { x: width - margin - 140, y, size: 7, font, color: gray });
-
-  return Buffer.from(await doc.save());
-}
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -171,12 +21,21 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return NextResponse.json({ error: "Invoice not found" }, { status: 404 });
     }
 
-    // Parse invoice data
-    let invoiceData = inv.invoiceData || {};
-    if (typeof invoiceData === "string") {
-      try { invoiceData = JSON.parse(invoiceData); } catch { invoiceData = {}; }
+    // Parse invoice data (summary + financials)
+    let rawData = inv.invoiceData || {};
+    if (typeof rawData === "string") {
+      try { rawData = JSON.parse(rawData); } catch { rawData = {}; }
     }
-    const summary: any[] = (invoiceData as Record<string, unknown>)?.summary as any[] || [];
+    const invData = rawData as Record<string, any>;
+    const summary: any[] = invData?.summary || [];
+    const invoiceDate = invData?.invoiceDate ? new Date(invData.invoiceDate).toLocaleDateString() : new Date().toLocaleDateString();
+    const dueDate = invData?.dueDate ? new Date(invData.dueDate).toLocaleDateString() : "";
+    const subtotal = invData?.subtotal ?? 0;
+    const taxRate = invData?.taxRate ?? 0.19;
+    const tax = invData?.tax ?? 0;
+    const total = invData?.total ?? 0;
+    const paymentInfo = invData?.paymentInfo || { bank: "TBD", account: "TBD", iban: "TBD", swift: "TBD" };
+    const invoiceBy = invData?.invoiceBy || { name: "NET2APP Hub", type: "Platform Provider", email: "support@net2app.com", vat: "TBD" };
 
     // Fetch SMTP config
     const [smtp] = await db.select().from(smtpConfig).where(eq(smtpConfig.isActive, true)).limit(1);
@@ -184,50 +43,92 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return NextResponse.json({ error: "SMTP not configured. Please configure SMTP in Settings first." }, { status: 400 });
     }
 
-    // Generate PDF
-    const pdfBuffer = await generateInvoicePdf(inv, summary);
+    // Generate PDF using the shared library
+    const pdfRaw = await generateInvoicePdf(inv as PdfInvoiceInput, summary);
+    const pdfBuffer = Buffer.from(pdfRaw);
 
-    // Build HTML body with MCC-MNC breakdown table
-    const entityLabel = inv.entityType === "client" ? "Client" : "Supplier";
-    const totSms = summary.reduce((a: number, b: any) => a + (b.totalSms || 0), 0);
-    const totAmount = summary.reduce((a: number, b: any) => a + (b.total || 0), 0);
+    // Build HTML body with destination-wise breakdown table
+    const fmtEuro = (v: number) => `€${v.toLocaleString("en", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
     let tableHtml = "";
     if (summary.length > 0) {
-      tableHtml = `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial;font-size:12px;width:100%;max-width:700px;">
-        <thead style="background:#2563eb;color:#fff;">
-          <tr><th style="padding:8px">MCC-MNC</th><th style="padding:8px">Country</th><th style="padding:8px">Operator</th>
-          <th style="padding:8px;text-align:right">SMS</th><th style="padding:8px;text-align:right">Rate</th>
-          <th style="padding:8px;text-align:right">Total</th></tr>
+      tableHtml = `<table cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial;font-size:12px;width:100%;max-width:700px;">
+        <thead style="background:#1f3a6b;color:#fff;">
+          <tr><th style="padding:8px;text-align:left">Destination</th><th style="padding:8px;text-align:left">MCC/MNC</th>
+          <th style="padding:8px;text-align:right">SMS Count</th><th style="padding:8px;text-align:right">Rate</th>
+          <th style="padding:8px;text-align:right">Amount</th></tr>
         </thead><tbody>`;
       for (const b of summary) {
-        tableHtml += `<tr style="background:${summary.indexOf(b) % 2 === 0 ? '#f8fafc' : '#fff'}">
-          <td style="padding:6px;font-family:monospace">${b.mccMnc || "N/A"}</td>
-          <td style="padding:6px">${b.country || "-"}</td>
-          <td style="padding:6px">${b.operator || "-"}</td>
+        const idx = summary.indexOf(b);
+        tableHtml += `<tr style="background:${idx % 2 === 0 ? '#f0f4ff' : '#fff'}">
+          <td style="padding:6px;font-weight:${idx === 0 ? 'bold' : 'normal'}">${b.destination || "Others"}</td>
+          <td style="padding:6px;font-family:monospace">${b.mcc ? `${b.mcc}*` : "*"}</td>
           <td style="padding:6px;text-align:right">${(b.totalSms || 0).toLocaleString()}</td>
-          <td style="padding:6px;text-align:right">$${(b.rate || 0).toFixed(6)}</td>
-          <td style="padding:6px;text-align:right;font-weight:bold">$${(b.total || 0).toFixed(4)}</td>
+          <td style="padding:6px;text-align:right">${fmtEuro(b.rate || 0)}</td>
+          <td style="padding:6px;text-align:right;font-weight:bold">${fmtEuro(b.total || 0)}</td>
         </tr>`;
       }
       tableHtml += `</tbody></table>`;
     }
 
     const html = `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:700px">
-        <h2 style="color:#1e40af;">Invoice ${inv.invoiceNumber}</h2>
-        <p style="color:#64748b;font-size:13px">
-          <strong>${entityLabel}:</strong> ${inv.entityName || "N/A"}<br>
-          <strong>Period:</strong> ${new Date(inv.periodStart).toLocaleDateString()} — ${new Date(inv.periodEnd).toLocaleDateString()}<br>
-          <strong>Status:</strong> ${(inv.status || "draft").toUpperCase()}<br>
-          <strong>Billing:</strong> ${inv.billingType === "dlr" ? "On DLR (Delivered Only)" : "On Submit"}<br>
-          <strong>Total SMS:</strong> ${totSms.toLocaleString()} | <strong>Total Amount:</strong> $${totAmount.toFixed(4)}
-        </p>
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:700px;margin:0 auto">
+        <div style="padding:24px 0;border-bottom:2px solid #1f3a6b">
+          <h1 style="color:#0d1b3e;font-size:22px;margin:0">NET2APP Hub</h1>
+          <p style="color:#64748b;font-size:12px;margin:2px 0 0">Enterprise SMS Platform</p>
+          <p style="color:#1f3a6b;font-size:11px;margin:2px 0 0">support@net2app.com</p>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin:16px 0">
+          <div>
+            <h2 style="color:#1f3a6b;font-size:26px;margin:0">INVOICE</h2>
+            <p style="font-size:13px;margin:2px 0">${inv.invoiceNumber}</p>
+            <span style="display:inline-block;padding:2px 10px;background:#f5e6b8;color:#8b6914;border-radius:3px;font-size:10px;font-weight:bold">${(inv.status || "draft").toUpperCase()}</span>
+          </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin:16px 0;border-bottom:1px solid #e2e8f0;padding-bottom:16px">
+          <div>
+            <p style="color:#94a3b8;font-size:10px;margin:0 0 2px;font-weight:bold">INVOICE TO</p>
+            <p style="font-size:14px;font-weight:bold;margin:0">${inv.entityName || "N/A"}</p>
+            <p style="font-size:11px;color:#64748b;margin:2px 0 0">${inv.entityType === "client" ? "Client" : "Supplier"}</p>
+          </div>
+          <div style="text-align:right">
+            <p style="color:#94a3b8;font-size:10px;margin:0 0 2px;font-weight:bold">INVOICE BY</p>
+            <p style="font-size:14px;font-weight:bold;margin:0">${invoiceBy.name}</p>
+            <p style="font-size:11px;color:#64748b;margin:2px 0 0">${invoiceBy.type}</p>
+          </div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:11px">
+          <tr>
+            <td style="padding:4px 0"><span style="color:#94a3b8;font-weight:bold">Invoice Date:</span> ${invoiceDate}</td>
+            <td style="padding:4px 0"><span style="color:#94a3b8;font-weight:bold">Period Start:</span> ${new Date(inv.periodStart).toLocaleDateString()}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0"><span style="color:#94a3b8;font-weight:bold">Period End:</span> ${new Date(inv.periodEnd).toLocaleDateString()}</td>
+            <td style="padding:4px 0"><span style="color:#94a3b8;font-weight:bold">Due Date:</span> ${dueDate}</td>
+          </tr>
+        </table>
         <hr style="border:none;border-top:1px solid #e2e8f0">
-        <h3 style="color:#334155;">MCC-MNC Usage Breakdown</h3>
+        <h3 style="color:#334155;font-size:14px;margin:12px 0 8px">Destination-Wise Breakdown</h3>
         ${tableHtml || "<p style='color:#94a3b8'>No breakdown data available.</p>"}
-        <hr style="border:none;border-top:1px solid #e2e8f0;margin-top:16px">
-        <p style="font-size:11px;color:#94a3b8;">This invoice was generated by Net2App Blast — Enterprise SMS Gateway.</p>
+        ${summary.length > 0 ? `
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:12px 0">
+        <div style="text-align:right;font-size:13px">
+          <p style="margin:2px 0"><span style="color:#64748b">Subtotal:</span> <strong>${fmtEuro(subtotal)}</strong></p>
+          <p style="margin:2px 0"><span style="color:#64748b">Tax (${Math.round(taxRate * 100)}%):</span> <strong>${fmtEuro(tax)}</strong></p>
+          <div style="background:#0d1b3e;color:#fff;padding:8px 16px;display:inline-block;border-radius:4px;margin-top:4px">
+            <strong style="font-size:16px">TOTAL: ${fmtEuro(total)}</strong>
+          </div>
+        </div>` : ''}
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0">
+        <h4 style="color:#0d1b3e;font-size:13px;margin:0 0 8px">Payment Information</h4>
+        <table style="font-size:11px">
+          <tr><td style="color:#94a3b8;width:80px;padding:2px 0">Bank:</td><td>${paymentInfo.bank || "TBD"}</td></tr>
+          <tr><td style="color:#94a3b8;padding:2px 0">Account:</td><td>${paymentInfo.account || "TBD"}</td></tr>
+          <tr><td style="color:#94a3b8;padding:2px 0">IBAN:</td><td>${paymentInfo.iban || "TBD"}</td></tr>
+          <tr><td style="color:#94a3b8;padding:2px 0">BIC/SWIFT:</td><td>${paymentInfo.swift || "TBD"}</td></tr>
+        </table>
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:12px 0">
+        <p style="font-size:10px;color:#94a3b8;">This invoice was generated by NET2APP Hub — Enterprise SMS Platform.</p>
       </div>
     `;
 

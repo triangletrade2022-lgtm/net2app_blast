@@ -1,4 +1,5 @@
 /home/ubuntu/net2app-platform/java-smsc-gateway/src/main/java/com/net2app/gateway/SupplierManager.java
+/home/ubuntu/net2app-platform/java-smsc-gateway/src/main/java/com/net2app/gateway/HttpSupplierClient.java
 /home/ubuntu/net2app-platform/java-smsc-gateway/src/main/java/com/net2app/gateway/GatewayApp.java
 /home/ubuntu/net2app-platform/java-smsc-gateway/src/main/java/com/net2app/gateway/ApiServer.java
 /home/ubuntu/net2app-platform/java-smsc-gateway/src/main/java/com/net2app/gateway/MccMncLookup.java

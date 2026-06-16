@@ -10,12 +10,9 @@ export function generateApiKey(): string {
   return `n2a_${uuidv4().replace(/-/g, "")}`;
 }
 
-export function generateInvoiceNumber(): string {
-  const d = new Date();
-  const yr = d.getFullYear();
-  const mo = String(d.getMonth() + 1).padStart(2, "0");
-  const rnd = Math.floor(Math.random() * 9999).toString().padStart(4, "0");
-  return `INV-${yr}${mo}-${rnd}`;
+export function generateInvoiceNumber(seq: number): string {
+  const yr = new Date().getFullYear();
+  return `INV-${yr}-${String(seq).padStart(3, "0")}`;
 }
 
 export function generateCode(prefix: string): string {
