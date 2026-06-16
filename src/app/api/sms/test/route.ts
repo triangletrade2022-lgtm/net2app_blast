@@ -180,8 +180,9 @@ export async function POST(req: NextRequest) {
       } catch (err) { smsStatus = "failed"; sendResult = "failed"; sendReason = err instanceof Error ? err.message : "API error"; }
     } else { outMsgId = `TEST-${Date.now()}`; supplierMsgId = outMsgId; }
 
-    // Force DLR fallback (only if API didn't already determine delivery)
-    if (!deliverResult && (forceDlr !== undefined ? forceDlr : (client.forceDlr || supplier.forceDlr))) {
+    // Force DLR fallback — ONLY when supplier accepted the SMS (not failed)
+    // Never override a supplier's explicit failure with a forced "delivered" status
+    if (smsStatus !== "failed" && !deliverResult && (forceDlr !== undefined ? forceDlr : (client.forceDlr || supplier.forceDlr))) {
       dlrStatus = client.forceDlrStatus || supplier.forceDlrStatus || "delivered";
       deliverResult = dlrStatus; deliverTime = new Date();
     }
@@ -230,7 +231,9 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const finalStatus = smsStatus === "delivered" ? "delivered" : (dlrStatus === "delivered" ? "delivered" : smsStatus);
+    // Final status: if supplier explicitly failed, status is ALWAYS failed
+    // Only allow "delivered" if the supplier accepted or a real DLR confirmed it
+    const finalStatus = smsStatus === "failed" ? "failed" : (smsStatus === "delivered" ? "delivered" : (dlrStatus === "delivered" ? "delivered" : smsStatus));
     const doneTime = deliverTime || (smsStatus === "submitted" ? new Date() : null);
 
     const [log] = await db.insert(smsLogs).values({
@@ -246,21 +249,22 @@ export async function POST(req: NextRequest) {
       sender: sender || "Net2App", oriReceiver: recipient, recipient, dstReceiver: recipient.replace(/^00/, "").replace(/^\+/, ""),
       messageText, destSms: messageText, smsBytes, destSmsBytes: smsBytes, parts, chargedPoints: parts,
       status: finalStatus as "pending"|"submitted"|"delivered"|"failed"|"rejected"|"expired",
-      submitSuccess: smsStatus === "submitted" || smsStatus === "delivered" ? 1 : 0,
-      submitFail: smsStatus === "failed" ? 1 : 0,
-      deliverSuccess: smsStatus === "delivered" || dlrStatus === "delivered" ? 1 : 0,
-      deliverFail: smsStatus === "failed" || dlrStatus === "failed" ? 1 : 0,
+      submitSuccess: finalStatus === "submitted" || finalStatus === "delivered" ? 1 : 0,
+      submitFail: finalStatus === "failed" ? 1 : 0,
+      deliverSuccess: finalStatus === "delivered" ? 1 : 0,
+      deliverFail: finalStatus === "failed" ? 1 : 0,
       sendResult, sendReason, deliverResult, dlrStatus, mcc, mnc,
       inMsgId, outMsgId, supplierMsgId,
       clientRate: String(clientRateVal), supplierRate: String(supplierRateVal),
-      cost: String(cost), pay: String(pay), profit: String(profit),
+      cost: String(finalStatus === "failed" ? 0 : cost), pay: String(finalStatus === "failed" ? 0 : pay), profit: String(finalStatus === "failed" ? 0 : profit),
       sendTime, deliverTime, doneTime,
       duration: doneTime ? Math.floor((doneTime.getTime() - sendTime.getTime()) / 1000) : 0,
       deliverDuration: deliverTime ? Math.floor((deliverTime.getTime() - sendTime.getTime()) / 1000) : null,
       connectionType: "http", direction: "mt", ipAddress: clientIp,
     }).returning();
 
-    if (lic) {
+    // Only count toward license volume if SMS was not failed
+    if (lic && finalStatus !== "failed") {
       await db.update(license).set({ currentUsage: (lic.currentUsage || 0) + parts, updatedAt: new Date() }).where(eq(license.id, lic.id));
     }
 
