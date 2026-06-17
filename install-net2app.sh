@@ -8,24 +8,50 @@
 set -e
 
 # ═══════════════════════════════════════════════════════════════════
-# CREDENTIALS
+# CREDENTIALS — Generated securely, prompted interactively
 # ═══════════════════════════════════════════════════════════════════
 DB_NAME="net2app_db"
 DB_USER="net2app_user"
-DB_PASS="Ariyax2024Net2AppDB"
 DB_SUPERUSER="postgres"
-DB_SUPERPASS="Ariyax2024Postgres"
 
 APP_USER="ubuntu"
 APP_DIR="/home/${APP_USER}/net2app"
 APP_PORT="3000"
 DOMAIN=""
 
-JWT_SECRET="AriyaxNet2AppJWTSecretKey2024Secure"
 SUPERUSER_NAME="superuser"
-SUPERUSER_PASS="Telco1988"
 ADMIN_EMAIL="admin@net2app.com"
-ADMIN_PASS="admin123"
+
+# Generate secure random defaults
+DB_PASS=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24)
+DB_SUPERPASS=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24)
+JWT_SECRET=$(head -c 64 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 48)
+SUPERUSER_PASS=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
+ADMIN_PASS=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
+
+# Allow user to override credentials interactively
+echo -e "${YELLOW}╔════════════════════════════════════════════════════════╗"
+echo "║     Credential Configuration                          ║"
+echo "║     Press Enter to accept secure defaults              ║"
+echo "╚════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+read -p "$(echo -e ${CYAN}Database password [auto-generated]: ${NC})" INPUT_DB_PASS
+DB_PASS="${INPUT_DB_PASS:-$DB_PASS}"
+
+read -p "$(echo -e ${CYAN}Postgres superuser password [auto-generated]: ${NC})" INPUT_SUPERPASS
+DB_SUPERPASS="${INPUT_SUPERPASS:-$DB_SUPERPASS}"
+
+read -p "$(echo -e ${CYAN}JWT secret [auto-generated]: ${NC})" INPUT_JWT
+JWT_SECRET="${INPUT_JWT:-$JWT_SECRET}"
+
+read -p "$(echo -e ${CYAN}Superuser login password [auto-generated]: ${NC})" INPUT_SUPUSER_PASS
+SUPERUSER_PASS="${INPUT_SUPUSER_PASS:-$SUPERUSER_PASS}"
+
+read -p "$(echo -e ${CYAN}Admin login password [auto-generated]: ${NC})" INPUT_ADMIN_PASS
+ADMIN_PASS="${INPUT_ADMIN_PASS:-$ADMIN_PASS}"
+
+echo -e "${GREEN}✓ Credentials configured (saved to /home/${APP_USER}/net2app-credentials.txt)${NC}"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 
@@ -322,7 +348,7 @@ cat > "/home/${APP_USER}/net2app-credentials.txt" << CREDENTIALS
 ║
 ║  LOGIN CREDENTIALS
 ║  ├── Superuser:     ${SUPERUSER_NAME} / ${SUPERUSER_PASS}
-║  └── Admin:         admin@net2app.com / admin123
+║  └── Admin:         ${ADMIN_EMAIL} / ${ADMIN_PASS}
 ║
 ║  API
 ║  ├── SMS Send:      POST /api/sms/send?apikey=KEY&...
