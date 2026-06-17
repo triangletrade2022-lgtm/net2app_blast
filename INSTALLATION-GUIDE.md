@@ -84,7 +84,7 @@ sudo chmod -R 755 /home/ubuntu/net2app
 ### Step 6: Copy Application Files
 ```bash
 # From your local machine:
-scp -r ./src ./public ./package.json ./tsconfig.json ./next.config.ts ./postcss.config.mjs ./drizzle.config.json ./eslint.config.mjs ubuntu@YOUR_SERVER_IP:/home/ubuntu/net2app/
+scp -r ./src ./public ./package.json ./tsconfig.json ./next.config.ts ./postcss.config.mjs ./drizzle.config.ts ./eslint.config.mjs ubuntu@YOUR_SERVER_IP:/home/ubuntu/net2app/
 
 # Or if you have a zip:
 unzip net2app-blast.zip -d /home/ubuntu/net2app/
@@ -92,11 +92,10 @@ unzip net2app-blast.zip -d /home/ubuntu/net2app/
 
 ### Step 7: Create .env File
 ```bash
-sudo tee /home/ubuntu/net2app/.env << 'EOF'
-DATABASE_URL=postgresql://net2app_user:Ariyax2024Net2AppDB@127.0.0.1:5432/net2app_db
-JWT_SECRET=AriyaxNet2AppJWTSecretKey2024Secure
-NODE_ENV=production
-EOF
+cd /home/ubuntu/net2app
+cp .env.example .env
+# Edit .env with your actual values:
+sudo nano .env
 
 sudo chown ubuntu:ubuntu /home/ubuntu/net2app/.env
 sudo chmod 600 /home/ubuntu/net2app/.env
