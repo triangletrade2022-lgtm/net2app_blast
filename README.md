@@ -283,6 +283,10 @@ If disconnected for 60+ minutes, the SMPP gateway is automatically restarted.
 - **Process Management**: PM2
 - **Auth**: JWT (jsonwebtoken + bcryptjs)
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history and version details.
+
 ## License
 
 See [LICENSE](LICENSE) for details.
