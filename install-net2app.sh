@@ -137,6 +137,11 @@ cd "${APP_DIR}"
 sudo -u "${APP_USER}" npm install --omit=dev > /dev/null 2>&1
 echo -e "${GREEN}✓ NPM packages installed${NC}"
 
+# ── Step 8b: Configure Git Hooks ──────────────────────
+cd "${APP_DIR}"
+sudo -u "${APP_USER}" git config core.hooksPath .githooks 2>/dev/null || true
+echo -e "${GREEN}✓ Git pre-commit hook configured (blocks .env files)${NC}"
+
 # ── Step 9: Build Application ──────────────────────────
 echo -e "${YELLOW}[Step 9/14] Building application...${NC}"
 sudo -u "${APP_USER}" npm run build 2>&1 | tail -3
