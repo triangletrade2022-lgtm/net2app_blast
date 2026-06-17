@@ -57,6 +57,9 @@ jobs:
 
       - name: ESLint
         run: npm run lint
+        env:
+          DATABASE_URL: postgresql://net2app_user:ci_password@127.0.0.1:5432/net2app_db
+          JWT_SECRET: ci-jwt-secret-for-build
 
       - name: Build
         run: npm run build
@@ -77,10 +80,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.x"
           cache: "pip"
 
       - name: Install dependencies
