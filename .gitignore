@@ -12,3 +12,7 @@ smpp_env/
 dist/
 build/
 .vercel
+tsconfig.tsbuildinfo
+java-smsc-gateway/target/
+backup*.sql
+net2app-credentials.txt

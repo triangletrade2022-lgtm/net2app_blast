@@ -1,9 +1,12 @@
+const path = require('path');
+const cwd = process.cwd();
+
 module.exports = {
   apps: [{
     name: 'net2app-blast',
-    script: '/home/ubuntu/net2app-platform/scripts/next-start.sh',
-    args: '',
-    cwd: '/home/ubuntu/net2app-platform',
+    script: 'node_modules/.bin/next',
+    args: 'start -p 3000',
+    cwd: cwd,
     instances: 1,
     exec_mode: 'fork',
     autorestart: true,
@@ -13,25 +16,9 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: 3000,
     },
-    error_file: '/home/ubuntu/net2app-platform/logs/error.log',
-    out_file: '/home/ubuntu/net2app-platform/logs/output.log',
+    error_file: path.join(cwd, 'logs/error.log'),
+    out_file: path.join(cwd, 'logs/output.log'),
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
-  }, {
-    name: 'net2app-smsc',
-    script: 'java',
-    args: '-jar /home/ubuntu/net2app-platform/java-smsc-gateway/target/java-smsc-gateway-1.0.0.jar',
-    cwd: '/home/ubuntu/net2app-platform',
-    instances: 1,
-    exec_mode: 'fork',
-    autorestart: true,
-    watch: false,
-    max_memory_restart: '512M',
-    env: {
-      DB_PASS: 'Ariyax2024Net2AppDB',
-      SMSC_PORT: '2777',
-    },
-    error_file: '/home/ubuntu/net2app-platform/logs/java_gateway_error.log',
-    out_file: '/home/ubuntu/net2app-platform/logs/java_gateway.log',
-    log_date_format: 'YYYY-MM-DD HH:mm:ss',
-    }]
+    merge_logs: true,
+  }]
 };

@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white" alt="PostgreSQL"/>
   <img src="https://img.shields.io/badge/node-%3E%3D22-339933?logo=node.js&logoColor=white" alt="Node.js"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License"/>
-  <img src="https://img.shields.io/badge/SMPP-v3.4-8B5CF6?logo=datadog&logoColor=white" alt="SMPP"/>
+  <img src="https://img.shields.io/badge/SMPP-v5.0%2Fv3.4%2Fv3.3-8B5CF6?logo=datadog&logoColor=white" alt="SMPP"/>
 </p>
 
 An enterprise-grade SMS gateway platform with SMPP/HTTP API support, real-time DLR tracking, dynamic routing, client & supplier management, invoicing, and a built-in monitoring dashboard.
@@ -67,19 +67,36 @@ An enterprise-grade SMS gateway platform with SMPP/HTTP API support, real-time D
 
 ## Quick Start
 
-### Prerequisites
-- Node.js 22.x
-- PostgreSQL 16
-- Python 3.10+ (for SMPP gateway)
-- PM2 (process manager)
-
-### Installation
-
-See [INSTALLATION-GUIDE.md](INSTALLATION-GUIDE.md) for the complete setup guide, or use the automated installer:
+### One-Line Install (Ubuntu 22.04/24.04)
 
 ```bash
-sudo bash install-net2app.sh
+git clone https://github.com/triangletrade2022-lgtm/net2app_blast.git && cd net2app_blast && sudo bash install-net2app.sh
 ```
+
+This installs everything automatically: Node.js 22, PostgreSQL 16, Python SMPP gateway, PM2, and the full application with database schema and seed data.
+
+### Prerequisites
+- Ubuntu 22.04 or 24.04 LTS
+- Root access (sudo)
+- 2GB+ RAM, 20GB+ disk
+
+### What Gets Installed
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| Node.js | 22.x | Application runtime |
+| PostgreSQL | 16 | Database |
+| PM2 | Latest | Process manager |
+| Python | 3.x | SMPP gateway (ESMC + SMSC) |
+| SMPP Libraries | smppy, smpp.pdu | SMPP v3.3/v3.4/v5.0 protocol support |
+
+### After Installation
+1. Open `http://YOUR_SERVER_IP:3000`
+2. Login: `superuser` / `Telco1988`
+3. Go to **Suppliers** → Configure your SMSC suppliers
+4. Go to **SMSC Status** (`/smpp/status`) → Verify supplier connections
+5. Send a test SMS via **Test SMS** page
+
+See [INSTALLATION-GUIDE.md](INSTALLATION-GUIDE.md) for detailed manual setup instructions.
 
 ### Manual Setup
 
@@ -237,7 +254,7 @@ If disconnected for 60+ minutes, the SMPP gateway is automatically restarted.
 ## SMPP Gateway Details
 
 ### ESMC Server (Port 2775)
-- **Protocol**: SMPP v3.4 (using smppy framework)
+- **Protocol**: SMPP v5.0 / v3.4 / v3.3 (auto-detected, using smppy framework)
 - **Authentication**: Client credentials from `clients` table
 - **IP Whitelisting**: Manual (allowed_ips) or auto-whitelist on first connection
 - **Keepalive**: Enquire link every 30 seconds
@@ -246,6 +263,8 @@ If disconnected for 60+ minutes, the SMPP gateway is automatically restarted.
 ### SMSC Supplier Manager
 - **Discovery**: Reads active SMPP suppliers from database every 10 seconds
 - **Connection**: Persistent TCP/TLS connections with auto-reconnect
+- **SMPP Version**: Auto-detects v5.0 → v3.4 → v3.3 for maximum compatibility
+- **Bind Fallback**: Tries transceiver first, falls back to transmitter
 - **Retry**: Exponential backoff (5s + 2s × attempt, max 30s)
 - **DLR Listening**: Each supplier has a dedicated listen loop
 - **Enquire Link**: Every ~15 seconds per supplier connection

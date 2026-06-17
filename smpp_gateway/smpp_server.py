@@ -107,6 +107,129 @@ _SMPP_STATUS_MAP = {
     0x000000c8: 'ESME_RDELIVERFAILURE',  # 200 decimal
 }
 
+
+class SmppParsedPdu:
+    """Lightweight PDU object for manual SMPP response parsing.
+    Mimics the interface of smpp.pdu PDU objects for backward compatibility."""
+    def __init__(self):
+        self.command_id = ''
+        self.command_status = ''
+        self.status = 0  # raw integer status code for comparisons
+        self.sequence_number = 0
+        self.params = {}
+        self.message_id = None
+        self.short_message = None
+        self.esm_class = 0
+        self.system_id = ''
+
+
+def _parse_cstring(data, offset):
+    """Read a null-terminated C string from bytes at offset.
+    Returns (string_value, new_offset_after_null)."""
+    end = data.find(b'\x00', offset)
+    if end == -1:
+        return data[offset:].decode('latin-1', errors='replace'), len(data)
+    return data[offset:end].decode('latin-1', errors='replace'), end + 1
+
+
+def _parse_smpp_response(header, body):
+    """Manually parse an SMPP response PDU from raw header + body bytes.
+    Used as primary parser because PDUEncoder.decode() fails on certain
+    bind_*_resp PDUs from strict SMSC servers (EIMS, etc.) with
+    'Invalid command length' errors.
+
+    Handles: bind_*_resp, submit_sm_resp, deliver_sm, enquire_link_resp,
+             unbind_resp, generic_nack.
+    Returns a SmppParsedPdu with all relevant fields populated.
+    """
+    cmd_id_int = struct.unpack('>I', header[4:8])[0]
+    cmd_status_int = struct.unpack('>I', header[8:12])[0]
+    seq = struct.unpack('>I', header[12:16])[0]
+
+    pdu = SmppParsedPdu()
+    pdu.command_id = _SMPP_CMD_MAP.get(cmd_id_int, f'unknown_0x{cmd_id_int:08x}')
+    pdu.command_status = _SMPP_STATUS_MAP.get(cmd_status_int, f'ESME_0x{cmd_status_int:08x}')
+    pdu.status = cmd_status_int  # raw integer for comparisons
+    pdu.sequence_number = seq
+    pdu.params = {}
+
+    offset = 0
+
+    # bind_*_resp: system_id (COctetString, may be empty)
+    if cmd_id_int in (0x80000009, 0x80000002, 0x80000001):
+        if offset < len(body):
+            pdu.params['system_id'], offset = _parse_cstring(body, offset)
+            pdu.system_id = pdu.params['system_id']
+
+    # submit_sm_resp: message_id (COctetString, may be empty)
+    elif cmd_id_int == 0x80000004:
+        if offset < len(body):
+            pdu.params['message_id'], offset = _parse_cstring(body, offset)
+            pdu.message_id = pdu.params.get('message_id', '')
+
+    # deliver_sm: full mandatory body parsing
+    elif cmd_id_int == 0x00000005:
+        if offset < len(body):
+            pdu.params['service_type'], offset = _parse_cstring(body, offset)
+        if offset < len(body):
+            pdu.params['source_addr_ton'] = body[offset]; offset += 1
+        if offset < len(body):
+            pdu.params['source_addr_npi'] = body[offset]; offset += 1
+        if offset < len(body):
+            pdu.params['source_addr'], offset = _parse_cstring(body, offset)
+        if offset < len(body):
+            pdu.params['dest_addr_ton'] = body[offset]; offset += 1
+        if offset < len(body):
+            pdu.params['dest_addr_npi'] = body[offset]; offset += 1
+        if offset < len(body):
+            pdu.params['destination_addr'], offset = _parse_cstring(body, offset)
+        if offset < len(body):
+            pdu.params['esm_class'] = body[offset]; offset += 1
+            pdu.esm_class = pdu.params['esm_class']
+        if offset < len(body):
+            pdu.params['protocol_id'] = body[offset]; offset += 1
+        if offset < len(body):
+            pdu.params['priority_flag'] = body[offset]; offset += 1
+        if offset < len(body):
+            pdu.params['schedule_delivery_time'], offset = _parse_cstring(body, offset)
+        if offset < len(body):
+            pdu.params['validity_period'], offset = _parse_cstring(body, offset)
+        if offset < len(body):
+            pdu.params['replace_if_present_flag'] = body[offset]; offset += 1
+        if offset < len(body):
+            pdu.params['data_coding'] = body[offset]; offset += 1
+        if offset < len(body):
+            pdu.params['sm_default_msg_id'] = body[offset]; offset += 1
+        if offset < len(body):
+            sm_length = body[offset]; offset += 1
+            pdu.params['sm_length'] = sm_length
+            if offset + sm_length <= len(body):
+                pdu.params['short_message'] = body[offset:offset + sm_length]
+                pdu.short_message = pdu.params['short_message']
+            else:
+                pdu.params['short_message'] = b''
+                pdu.short_message = b''
+        # Parse optional TLVs if any bytes remain
+        tlvs = {}
+        while offset + 4 <= len(body):
+            try:
+                tag = struct.unpack('>H', body[offset:offset + 2])[0]
+                tlv_len = struct.unpack('>H', body[offset + 2:offset + 4])[0]
+                offset += 4
+                if offset + tlv_len <= len(body):
+                    tlvs[tag] = body[offset:offset + tlv_len]
+                    offset += tlv_len
+                else:
+                    break
+            except struct.error:
+                break
+        pdu.params['tlvs'] = tlvs
+
+    # enquire_link_resp, unbind_resp, generic_nack: empty body (no parsing needed)
+
+    return pdu
+
+
 os.makedirs('/home/ubuntu/net2app-platform/logs', exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -416,12 +539,12 @@ class SmppSupplierClient:
 
     async def connect_and_bind(self):
         """Connect TCP/TLS and bind. Returns True on success.
-        
-        Supports TLS connections (e.g. for Telnyx which requires TLS on port 2775).
-        Tries the configured bind_type in order:
-        - 'transceiver': tries transceiver first, falls back to transmitter
-        - 'transmitter': bind_transmitter only
-        - 'receiver': bind_receiver only
+
+        Supports TLS connections and auto-detects SMPP version (v5.0/v3.4/v3.3).
+        Tries the configured bind_type with v5.0 first, then v3.4, then v3.3:
+        - 'transceiver': transceiver v5.0 → v3.4 → v3.3, then transmitter v5.0 → v3.4 → v3.3
+        - 'transmitter': v5.0 → v3.4 → v3.3
+        - 'receiver': v5.0 → v3.4 → v3.3
         """
         try:
             if self.tls:
@@ -437,21 +560,31 @@ class SmppSupplierClient:
                 self.reader, self.writer = await asyncio.wait_for(
                     asyncio.open_connection(self.host, self.port), timeout=10)
 
+            # Auto-detect SMPP version: try v5.0, then v3.4, then v3.3
+            # Auto-detect bind type: try configured type, then fallbacks
+            versions = (0x50, 0x34, 0x33)
             if self.bind_type == 'receiver':
-                return await self._try_bind('receiver')
-
-            # Try bind_transceiver first, fallback to bind_transmitter
-            if self.bind_type == 'transceiver':
-                if await self._try_bind('transceiver'):
-                    return True
-                # If RINVCMDID (supplier doesn't support transceiver), try transmitter
-                if self._last_bind_status in (CommandStatus.ESME_RINVCMDID, CommandStatus.ESME_RBINDFAIL):
-                    logger.info(f"SMSC: transceiver not supported for {self.system_id}, trying transmitter")
-                    return await self._try_bind('transmitter')
+                for version in versions:
+                    if await self._try_bind('receiver', version):
+                        return True
                 return False
 
-            # bind_transmitter only
-            return await self._try_bind('transmitter')
+            if self.bind_type == 'transceiver':
+                # Try transceiver v5.0 → v3.4 → v3.3, then transmitter v5.0 → v3.4 → v3.3
+                for version in versions:
+                    if await self._try_bind('transceiver', version):
+                        return True
+                logger.info(f"SMSC: transceiver not supported for {self.system_id}, trying transmitter")
+                for version in versions:
+                    if await self._try_bind('transmitter', version):
+                        return True
+                return False
+
+            # bind_transmitter: try v5.0, then v3.4, then v3.3
+            for version in versions:
+                if await self._try_bind('transmitter', version):
+                    return True
+            return False
 
         except asyncio.TimeoutError:
             logger.error(f"SMSC connect timeout to {self.host}:{self.port}")
@@ -460,8 +593,13 @@ class SmppSupplierClient:
             logger.error(f"SMSC connect/bind error: {e}")
             return False
 
-    async def _try_bind(self, mode: str) -> bool:
-        """Try a specific bind operation (transceiver, transmitter, or receiver)."""
+    async def _try_bind(self, mode: str, interface_version: int = 0x34) -> bool:
+        """Try a specific bind operation (transceiver, transmitter, or receiver).
+
+        Args:
+            mode: 'transceiver', 'transmitter', or 'receiver'
+            interface_version: SMPP version (0x34=v3.4, 0x33=v3.3)
+        """
         if mode == 'transceiver':
             pdu_cls = BindTransceiver
             resp_cmd_id = CommandId.bind_transceiver_resp
@@ -483,13 +621,15 @@ class SmppSupplierClient:
                 system_id=self.system_id,
                 password=self.password,
                 system_type='',
-                interface_version=0x34,
+                interface_version=interface_version,
                 addr_ton=AddrTon.INTERNATIONAL,
                 addr_npi=AddrNpi.ISDN,
             )
             self.writer.write(self._encoder.encode(pdu))
             await self.writer.drain()
-            logger.debug(f"SMSC: sent bind_{mode_name}")
+            _VER_LABELS = {0x34: 'v3.4', 0x33: 'v3.3', 0x50: 'v5.0'}
+            v_label = _VER_LABELS.get(interface_version, f'0x{interface_version:02x}')
+            logger.debug(f"SMSC: sent bind_{mode_name} ({v_label})")
 
             resp = await self._read_pdu(timeout=10)
             if resp is None:
@@ -497,20 +637,29 @@ class SmppSupplierClient:
                 return False
 
             if resp.command_id == resp_cmd_id:
-                status = getattr(resp, 'status', CommandStatus.ESME_ROK)
-                self._last_bind_status = status
-                if status == CommandStatus.ESME_ROK:
+                raw_status = getattr(resp, 'status', 0)
+                # Normalize to integer (handles int, IntEnum, and string)
+                try:
+                    self._last_bind_status = int(raw_status)
+                except (TypeError, ValueError):
+                    self._last_bind_status = 0
+                if self._last_bind_status == 0:  # ESME_ROK
                     self.connected = True
                     self._bind_mode = mode
-                    logger.info(f"SMSC: bound as {self.system_id} ({mode_name}) [{self.host}:{self.port}]")
+                    logger.info(f"SMSC: bound as {self.system_id} ({mode_name} {v_label}) [{self.host}:{self.port}]")
+                    self._bound_version = interface_version
                     return True
                 else:
-                    logger.warning(f"SMSC: bind_{mode_name} failed with status {status}")
+                    logger.warning(f"SMSC: bind_{mode_name} ({v_label}) failed with status {self._last_bind_status}")
                     return False
             # Wrong response command ID — might be a different bind response
             # Check if it's a bind_transceiver_resp for a different bind type
-            self._last_bind_status = getattr(resp, 'status', CommandStatus.ESME_RINVCMDID)
-            logger.warning(f"SMSC: bind_{mode_name} got unexpected response cmd={resp.command_id} status={self._last_bind_status}")
+            raw_status = getattr(resp, 'status', 3)
+            try:
+                self._last_bind_status = int(raw_status)
+            except (TypeError, ValueError):
+                self._last_bind_status = 3  # ESME_RINVCMDID
+            logger.warning(f"SMSC: bind_{mode_name} ({v_label}) got unexpected response cmd={resp.command_id} status={self._last_bind_status}")
             return False
         except Exception as e:
             logger.error(f"SMSC bind_{mode_name} error: {e}")
@@ -559,7 +708,11 @@ class SmppSupplierClient:
                 return False, None
 
             if resp.command_id == CommandId.submit_sm_resp:
-                status = getattr(resp, 'status', CommandStatus.ESME_ROK)
+                raw_status = getattr(resp, 'status', 0)
+                try:
+                    status = int(raw_status)
+                except (TypeError, ValueError):
+                    status = 0
                 msg_id = getattr(resp, 'message_id', None)
                 if msg_id is None and hasattr(resp, 'params'):
                     msg_id = resp.params.get('message_id', '')
@@ -567,7 +720,7 @@ class SmppSupplierClient:
                     msg_id = ''
                 if isinstance(msg_id, bytes):
                     msg_id = msg_id.decode('utf-8', errors='replace')
-                ok = (status == CommandStatus.ESME_ROK)
+                ok = (status == 0)  # ESME_ROK is 0
                 return ok, str(msg_id) if msg_id else None
             return False, None
         except Exception as e:
@@ -608,36 +761,62 @@ class SmppSupplierClient:
             raise
 
     async def _read_pdu(self, timeout=10):
-        """Read a complete PDU from the socket using asyncio stream."""
+        """Read a complete PDU from the socket using asyncio stream.
+
+        Uses a robust manual parser as the primary method, with PDUEncoder as
+        fallback. The smpp.pdu library's PDUEncoder.decode() fails on certain
+        bind_*_resp PDUs from strict SMSC servers (EIMS, etc.) with
+        'Invalid command length' errors because it miscounts parsed bytes.
+        """
         try:
             header = await self._recv_exact(16, timeout)
             if not header or len(header) < 16:
                 return None
             length = struct.unpack('>I', header[:4])[0]
+
+            # Sanity check: SMPP PDU length must be >= 16 (header) and <= 64KB
+            if length < 16 or length > 65536:
+                logger.warning(f"SMSC: invalid PDU length {length}, discarding")
+                return None
+
             body_len = length - 16
             body = b''
             if body_len > 0:
                 body = await self._recv_exact(body_len, timeout)
+                if body is None:
+                    return None
+
             full = header + body
-            # Try PDUEncoder first, fallback to manual decode
+
+            # Primary: manual parser (reliable, handles all strict SMSC servers)
+            try:
+                return _parse_smpp_response(header, body)
+            except Exception as parse_err:
+                logger.debug(f"SMSC manual PDU parse error: {parse_err}")
+
+            # Fallback: PDUEncoder (may work for some PDU types)
             try:
                 return PDUEncoder().decode(io.BytesIO(full))
             except Exception as enc_err:
-                # Fallback: manually decode the response header
+                # Final fallback: basic header-only parsing
                 cmd_id = struct.unpack('>I', header[4:8])[0]
                 cmd_status = struct.unpack('>I', header[8:12])[0]
                 seq = struct.unpack('>I', header[12:16])[0]
-                logger.warning(f"SMSC PDU decode error ({enc_err}), raw: len={length} cmd=0x{cmd_id:08x} status=0x{cmd_status:08x} seq={seq}")
-                # Return a simple object with the string-based fields the library expects
+                logger.warning(
+                    f"SMSC PDU decode error ({enc_err}), raw: len={length} "
+                    f"cmd=0x{cmd_id:08x} status=0x{cmd_status:08x} seq={seq}"
+                )
                 cmd_name = _SMPP_CMD_MAP.get(cmd_id, f'unknown_0x{cmd_id:08x}')
                 status_name = _SMPP_STATUS_MAP.get(cmd_status, f'ESME_0x{cmd_status:08x}')
+
                 class RawPdu:
                     pass
                 resp = RawPdu()
                 resp.command_id = cmd_name
                 resp.command_status = status_name
-                setattr(resp, 'status', status_name)
+                resp.status = cmd_status  # raw integer for comparisons
                 resp.sequence_number = seq
+                resp.params = {}
                 return resp
         except asyncio.TimeoutError:
             return None

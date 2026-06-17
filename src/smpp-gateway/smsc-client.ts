@@ -90,42 +90,51 @@ export class SmppSupplierClient extends EventEmitter {
   }
 
   private tryBindChain(resolve: (result: boolean) => void): void {
+    // Auto-detect SMPP version: try v5.0, v3.4, v3.3
+    const versions = [0x50, 0x34, 0x33];
+
+    const tryVersions = (bindEvent: string, idx: number, cb: (ok: boolean) => void): void => {
+      if (idx >= versions.length) { cb(false); return; }
+      this.tryBind(bindEvent, (ok) => {
+        if (ok) { cb(true); return; }
+        tryVersions(bindEvent, idx + 1, cb);
+      }, versions[idx]);
+    };
+
     if (this.bindType === "receiver") {
-      this.tryBind("bind_receiver", resolve);
+      tryVersions("bind_receiver", 0, resolve);
     } else if (this.bindType === "transceiver") {
-      this.tryBind("bind_transceiver", (ok) => {
-        if (ok) {
-          resolve(true);
-        } else {
-          // Fallback to transmitter
-          logger.info(`Transceiver failed for ${this.systemId}, trying transmitter`);
-          this.tryBind("bind_transmitter", resolve);
-        }
+      tryVersions("bind_transceiver", 0, (ok) => {
+        if (ok) { resolve(true); return; }
+        logger.info(`Transceiver not supported for ${this.systemId}, trying transmitter`);
+        tryVersions("bind_transmitter", 0, resolve);
       });
     } else {
-      this.tryBind("bind_transmitter", resolve);
+      tryVersions("bind_transmitter", 0, resolve);
     }
   }
 
-  private tryBind(bindEvent: string, resolve: (result: boolean) => void): void {
+  private tryBind(bindEvent: string, resolve: (result: boolean) => void, interfaceVersion: number = 0x34): void {
     if (!this.session) {
       resolve(false);
       return;
     }
 
-    const bindPdu = this.createBindPdu(bindEvent);
+    const versionLabels: Record<number, string> = { 0x50: "v5.0", 0x34: "v3.4", 0x33: "v3.3" };
+    const vLabel = versionLabels[interfaceVersion] || `0x${interfaceVersion.toString(16)}`;
+    const bindPdu = this.createBindPdu(bindEvent, interfaceVersion);
     this.session.send(bindPdu, (resp: smpp.PDU) => {
       if (resp.command_status === 0) {
         this.connected = true;
         this.bindMode = this.normalizeBindMode(bindEvent);
         logger.info(
-          `Bound as ${this.systemId} (${this.bindMode}) [${this.host}:${this.port}]`,
+          `Bound as ${this.systemId} (${this.bindMode} ${vLabel}) [${this.host}:${this.port}]`,
         );
         this.setupDeliverSmListener();
         resolve(true);
       } else {
         logger.warn(
-          `Bind ${bindEvent} failed with status ${resp.command_status} for ${this.systemId}`,
+          `Bind ${bindEvent} (${vLabel}) failed with status ${resp.command_status} for ${this.systemId}`,
         );
         resolve(false);
       }
@@ -139,12 +148,12 @@ export class SmppSupplierClient extends EventEmitter {
     return mode;
   }
 
-  private createBindPdu(bindEvent: string): smpp.PDU {
+  private createBindPdu(bindEvent: string, interfaceVersion: number = 0x34): smpp.PDU {
     const pdu = new smpp.PDU(bindEvent, {
       system_id: this.systemId,
       password: this.password,
       system_type: "",
-      interface_version: 0x34,
+      interface_version: interfaceVersion,
       addr_ton: 1, // INTERNATIONAL
       addr_npi: 1, // ISDN
     });

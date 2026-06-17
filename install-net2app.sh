@@ -111,7 +111,7 @@ echo -e "${YELLOW}[Step 6/14] Copying application files...${NC}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "${SCRIPT_DIR}/package.json" ]; then
     echo "Copying from: ${SCRIPT_DIR}"
-    rsync -av --exclude 'node_modules' --exclude '.next' --exclude '.git' "${SCRIPT_DIR}/" "${APP_DIR}/" > /dev/null 2>&1
+    rsync -av --exclude 'node_modules' --exclude '.next' --exclude '.git' --exclude 'smpp_env' --exclude 'logs' --exclude '*.log' --exclude 'tsconfig.tsbuildinfo' --exclude 'ql -h*' "${SCRIPT_DIR}/" "${APP_DIR}/" > /dev/null 2>&1
 else
     echo -e "${RED}Error: package.json not found. Place this script in the project root.${NC}"
     exit 1
@@ -213,13 +213,13 @@ echo -e "${GREEN}✓ SMSC monitor cron added (every 5 minutes)${NC}"
 # ── Step 14: Setup PM2 & Firewall ──────────────────────
 echo -e "${YELLOW}[Step 14/14] Configuring PM2 and firewall...${NC}"
 
-cat > "${APP_DIR}/ecosystem.config.js" << 'PM2CONFIG'
+cat > "${APP_DIR}/ecosystem.config.js" << PM2CONFIG
 module.exports = {
   apps: [{
     name: 'net2app-blast',
     script: 'node_modules/.bin/next',
-    args: 'start -p 3000',
-    cwd: '/home/ubuntu/net2app',
+    args: 'start -p ${APP_PORT}',
+    cwd: '${APP_DIR}',
     instances: 1,
     exec_mode: 'fork',
     autorestart: true,
@@ -227,10 +227,10 @@ module.exports = {
     max_memory_restart: '1G',
     env: {
       NODE_ENV: 'production',
-      PORT: 3000,
+      PORT: ${APP_PORT},
     },
-    error_file: '/home/ubuntu/net2app/logs/error.log',
-    out_file: '/home/ubuntu/net2app/logs/output.log',
+    error_file: '${APP_DIR}/logs/error.log',
+    out_file: '${APP_DIR}/logs/output.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
   }]
