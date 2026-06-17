@@ -50,6 +50,7 @@ public class EsmeHandler implements SmppServerHandler {
         this.dbUser = dbUser;
         this.dbPass = dbPass;
         startDlrConsumer();
+        startDbDlrConsumer();
     }
 
     /** Set the supplier manager (called after construction to avoid circular dependency). */
@@ -88,6 +89,16 @@ public class EsmeHandler implements SmppServerHandler {
                     String name = rs.getString("name");
                     System.out.println("[ESME] " + name + " bound from " + remote);
                     updateBindStatus(conn, "client", clientId, "bound", systemId, remote);
+                    // Also update clients.smpp_bind_status for the frontend dashboard.
+                    // Use a fresh connection because updateBindStatus may close the borrowed one.
+                    try (Connection c2 = DriverManager.getConnection(dbUrl, dbUser, dbPass);
+                         PreparedStatement ps2 = c2.prepareStatement(
+                             "UPDATE clients SET smpp_bind_status = 'bound', updated_at = NOW() WHERE id = ?")) {
+                        ps2.setInt(1, clientId);
+                        ps2.executeUpdate();
+                    } catch (SQLException e2) {
+                        System.err.println("[ESME] Failed to update clients.bind_status: " + e2.getMessage());
+                    }
                     sessions.put(systemId, session);
                     clientIds.put(systemId, clientId);
                     clientSessions.put(clientId, session);
@@ -207,7 +218,19 @@ public class EsmeHandler implements SmppServerHandler {
         // Clean up forceDlrSent entries whose sessions are gone
         forceDlrSent.removeIf(mid -> !pendingDlrs.containsKey(mid));
         // Update DB to unbound
-        updateBindStatus(null, "client", 0, "unbound", session.getSystemId(), null);
+        updateBindStatus(null, "client", removedClientId != null ? removedClientId : 0,
+                         "unbound", session.getSystemId(), null);
+        // Also update clients.smpp_bind_status for the frontend dashboard
+        if (removedClientId != null && removedClientId > 0) {
+            try (Connection c2 = DriverManager.getConnection(dbUrl, dbUser, dbPass);
+                 PreparedStatement ps2 = c2.prepareStatement(
+                     "UPDATE clients SET smpp_bind_status = 'unbound', updated_at = NOW() WHERE id = ?")) {
+                ps2.setInt(1, removedClientId);
+                ps2.executeUpdate();
+            } catch (SQLException e2) {
+                System.err.println("[ESME] Failed to update clients.bind_status (unbind): " + e2.getMessage());
+            }
+        }
     }
 
     private void updateBindStatus(Connection conn, String entityType, int entityId,
@@ -230,7 +253,8 @@ public class EsmeHandler implements SmppServerHandler {
             ps.setString(5, remoteAddr);
             ps.executeUpdate();
         } catch (SQLException e) {
-            // Silently ignore if entity_id=0 (placeholder for unbind)
+            System.err.println("[ESME] updateBindStatus error for " + entityType
+                    + " id=" + entityId + " sysId=" + sysId + ": " + e.getMessage());
         }
     }
 
@@ -405,6 +429,114 @@ public class EsmeHandler implements SmppServerHandler {
         t.setDaemon(true);
         t.start();
     }
+
+    /**
+     * DB DLR Consumer: background thread that polls the dlr_queue PostgreSQL table
+     * for unprocessed DLRs and pushes them as deliver_sm to connected ESME clients.
+     * This handles DLRs created by the Next.js REST API (HTTP supplier sends)
+     * where the DLR is written to dlr_queue but not delivered in real-time.
+     * Polls every 2 seconds.
+     */
+    private void startDbDlrConsumer() {
+        Thread t = new Thread(() -> {
+            System.out.println("[DB DLR Consumer] Started — polling dlr_queue every 2s");
+            while (true) {
+                try {
+                    Thread.sleep(2000);
+                    processDbDlrQueue();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    System.err.println("[DB DLR Consumer] Error: " + e.getMessage());
+                }
+            }
+        }, "db-dlr-consumer");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * Process unprocessed DLRs from the dlr_queue table.
+     * For each unprocessed entry, look up the ESME client session and send a deliver_sm.
+     */
+    private void processDbDlrQueue() {
+        String selectSql = "SELECT dq.id, dq.sms_log_id, dq.client_id, dq.dlr_status, " +
+                           "dq.message_id, sl.message_id as sms_message_id, " +
+                           "sl.sender, sl.recipient, sl.supplier_id " +
+                           "FROM dlr_queue dq " +
+                           "JOIN sms_logs sl ON sl.id = dq.sms_log_id " +
+                           "WHERE dq.processed = false AND dq.direction = 'supplier_to_client' " +
+                           "ORDER BY dq.id LIMIT 20";
+
+        String updateSql = "UPDATE dlr_queue SET processed = true, processed_at = NOW() WHERE id = ?";
+
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+            // First collect the DLRs to process
+            var dlrsToProcess = new ArrayList<DlrQueueEntry>();
+            try (PreparedStatement ps = conn.prepareStatement(selectSql)) {
+                ResultSet rs = ps.executeQuery();
+                while (rs.next()) {
+                    dlrsToProcess.add(new DlrQueueEntry(
+                            rs.getInt("id"),
+                            rs.getInt("sms_log_id"),
+                            rs.getInt("client_id"),
+                            rs.getString("dlr_status"),
+                            rs.getString("message_id"),
+                            rs.getString("sms_message_id"),
+                            rs.getString("sender"),
+                            rs.getString("recipient"),
+                            rs.getInt("supplier_id")
+                    ));
+                }
+            }
+
+            for (var entry : dlrsToProcess) {
+                // Look up the ESME session for this client
+                SmppServerSession sess = clientSessions.get(entry.clientId());
+                if (sess == null) {
+                    // Client not connected — leave unprocessed for later retry
+                    continue;
+                }
+
+                // Build DLR text in SMPP format
+                String dlrText = buildDlrText(entry.messageId() != null ? entry.messageId() : "N/A",
+                        entry.dlrStatus() != null ? entry.dlrStatus() : "DELIVRD");
+
+                // For delivery receipts: source_addr = original recipient, dest_addr = original sender
+                DeliverSm dm = DeliverSm.builder()
+                        .asDeliveryReceipt()
+                        .sourceAddress((byte) 0, (byte) 0,
+                                entry.recipient() != null ? entry.recipient() : "")
+                        .destAddress((byte) 0, (byte) 0,
+                                entry.sender() != null ? entry.sender() : "")
+                        .shortMessage(dlrText.getBytes(java.nio.charset.StandardCharsets.US_ASCII))
+                        .build();
+
+                try {
+                    sess.sendDeliverSm(dm);
+                    System.out.println("[DB DLR Consumer] Pushed DLR to " + sess.getSystemId()
+                            + " for logId=" + entry.smsLogId() + " status=" + entry.dlrStatus());
+                    // Mark as processed
+                    try (PreparedStatement up = conn.prepareStatement(updateSql)) {
+                        up.setInt(1, entry.id());
+                        up.executeUpdate();
+                    }
+                } catch (Exception e) {
+                    System.err.println("[DB DLR Consumer] Failed to push DLR logId=" + entry.smsLogId()
+                            + " to " + sess.getSystemId() + ": " + e.getMessage());
+                    // Leave unprocessed for retry
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[DB DLR Consumer] DB error: " + e.getMessage());
+        }
+    }
+
+    /** Record for a dlr_queue row to process. */
+    private record DlrQueueEntry(int id, int smsLogId, int clientId, String dlrStatus,
+                                  String messageId, String smsMessageId,
+                                  String sender, String recipient, int supplierId) {}
 
     /**
      * Submit SMS via HTTP supplier API.

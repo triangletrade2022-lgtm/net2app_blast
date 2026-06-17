@@ -169,7 +169,7 @@ export async function POST(req: NextRequest) {
           outMsgId = supplierMsgId;
 
           // Map supplier status code to delivery result
-          // For BD suppliers like SMS Sheba: 0=delivered, all others=failed
+          // For BD suppliers like SMS Sheba: 0=delivered, 102=submitted
           const delivered = isStatusCodeDelivered(supplier.supplierCode, statusCode);
           if (delivered) {
             smsStatus = "delivered";

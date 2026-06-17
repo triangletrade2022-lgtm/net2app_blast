@@ -7,6 +7,7 @@ com/net2app/gateway/MccMncLookup.class
 com/net2app/gateway/SmsLogger.class
 com/net2app/gateway/EsmeHandler$ForceDlrConfig.class
 com/net2app/gateway/SupplierClient$1.class
+com/net2app/gateway/EsmeHandler$DlrQueueEntry.class
 com/net2app/gateway/EsmeHandler$DelayedDlr.class
 com/net2app/gateway/SupplierManager.class
 com/net2app/gateway/HttpSupplierClient.class

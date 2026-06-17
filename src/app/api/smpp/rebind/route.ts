@@ -2,8 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { handleApiError } from "@/lib/api-error";
 
 const REBIND_URLS = [
-  "http://127.0.0.1:9000/api/smpp/rebind",  // Java SMSC gateway
-  "http://127.0.0.1:9001/api/smpp/rebind",  // Python SMPP gateway
+  "http://127.0.0.1:9000/api/smpp/rebind",  // Java 21 SMSC gateway
 ];
 
 export async function POST(req: NextRequest) {

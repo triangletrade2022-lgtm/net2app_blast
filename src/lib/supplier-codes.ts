@@ -20,7 +20,7 @@ export interface SupplierCodeMap {
 export const SMS_SHEBA_CODES: Record<string, string> = {
   "0":    "delivered",
   "101":  "invalid message length",
-  "102":  "send not valid",
+  "102":  "invalid sender ID",
   "103":  "authentication failed",
   "104":  "invalid user",
   "105":  "invalid MSISDN",
@@ -74,23 +74,4 @@ export function isStatusCodeDelivered(
   
   // Default: status 0 or empty = delivered
   return code === "0" || code === "";
-}
-
-/**
- * Get the delivery result string for a supplier status code.
- * Returns "delivered" for status 0, or the error description for non-0.
- */
-export function getDeliverResultFromStatus(
-  supplierCode: string | undefined | null,
-  statusCode: string | number
-): string {
-  const code = String(statusCode);
-  
-  if (supplierCode === "SMSSHEBA") {
-    if (code === "0") return "delivered";
-    return SMS_SHEBA_CODES[code] || `failed (code: ${code})`;
-  }
-  
-  if (code === "0") return "delivered";
-  return `failed (code: ${code})`;
 }

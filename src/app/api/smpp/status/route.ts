@@ -5,8 +5,7 @@ import { eq, desc, and, inArray, not } from "drizzle-orm";
 import { handleApiError } from "@/lib/api-error";
 
 const GATEWAY_URLS = [
-  "http://127.0.0.1:9000/api/smpp/status",  // Java SMSC gateway
-  "http://127.0.0.1:9001/api/smpp/status",  // Python SMPP gateway
+  "http://127.0.0.1:9000/api/smpp/status",  // Java 21 SMSC gateway
 ];
 
 interface SmppSupplierStatus {
@@ -76,7 +75,7 @@ export async function GET() {
 
     for (let i = 0; i < GATEWAY_URLS.length; i++) {
       const { status, error } = results[i];
-      const label = i === 0 ? "Java" : "Python";
+      const label = "Java 21";
 
       if (error) {
         errors.push(`${label}: ${error}`);

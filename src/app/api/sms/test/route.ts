@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { smsLogs, clients, suppliers, routes, routeTrunks, trunks, clientRates, supplierRates, license, operators } from "@/db/schema";
+import { smsLogs, clients, suppliers, routes, routeTrunks, trunks, clientRates, supplierRates, license, operators, dlrQueue } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { generateMessageId, calculateSmsParts, getSmsByteSize, getSmsEncoding } from "@/lib/helpers";
 import { handleApiError } from "@/lib/api-error";
@@ -296,6 +296,7 @@ export async function POST(req: NextRequest) {
     if (lic && finalStatus !== "failed") {
       await db.update(license).set({ currentUsage: (lic.currentUsage || 0) + parts, updatedAt: new Date() }).where(eq(license.id, lic.id));
     }
+    if (dlrStatus) await db.insert(dlrQueue).values({ smsLogId: log.id, messageId, clientId: client.id, supplierId: supplier.id, dlrStatus, direction: "supplier_to_client" });
 
     return NextResponse.json({
       success: true, messageId, logId: log.id, status: smsStatus,
