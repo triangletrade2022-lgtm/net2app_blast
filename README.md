@@ -210,19 +210,24 @@ net2app-platform/
 ## Configuration
 
 ### Environment Variables
+
+Copy the example file to get started:
+```bash
+cp .env.example .env
+```
+
+See [`.env.example`](.env.example) for a full list with descriptions.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | Required |
-| `JWT_SECRET` | JWT signing secret | Required |
+| `DATABASE_URL` | PostgreSQL connection string | **Required** |
+| `JWT_SECRET` | JWT signing secret | **Required** |
 | `NODE_ENV` | Environment mode | `production` |
-
-### SMPP Gateway (hardcoded in smpp_server.py)
-| Setting | Value |
-|---------|-------|
-| ESMC Host | `0.0.0.0` |
-| ESMC Port | `2775` |
-| REST API Port | `9000` |
-| DB Host | `127.0.0.1:5432` |
+| `PORT` | Next.js app port | `3000` |
+| `SMPP_ESMC_HOST` | ESMC server bind address | `0.0.0.0` |
+| `SMPP_ESMC_PORT` | ESMC server listen port | `2775` |
+| `SMPP_API_HOST` | REST API bridge host | `127.0.0.1` |
+| `SMPP_API_PORT` | REST API bridge port | `9000` |
 
 ## Monitoring
 
