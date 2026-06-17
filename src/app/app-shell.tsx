@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 
 // Types
 interface User { id: number; email: string; username?: string; name: string; role: string; permissions?: unknown; lastLogin?: string; lastLoginIp?: string; }
@@ -254,14 +254,25 @@ function BalanceTab() {
   const [sbal,setSbal]=useState<BalanceEntry[]>([]);
   const [show,setShow]=useState(false);
   const [f,setF]=useState({type:"client",eid:"",amount:"",op:"add_balance"});
+  const [changedIds,setChangedIds]=useState<Set<number>>(new Set());
+  const prevRef=useRef<Record<string,string>>({});
 
   const load=useCallback(async()=>{
     const cl=await api("/api/balance?type=client");
     const su=await api("/api/balance?type=supplier");
-    if(Array.isArray(cl))setCbal(cl);
+    if(Array.isArray(cl)){
+      // Detect balance changes for highlight animation
+      const changed=new Set<number>();
+      cl.forEach((e:BalanceEntry)=>{const k=`c${e.id}`;const prev=prevRef.current[k];const cur=`${e.currentBalance}:${e.creditLimit}`;if(prev&&prev!==cur)changed.add(e.id);prevRef.current[k]=cur;});
+      su.forEach((e:BalanceEntry)=>{const k=`s${e.id}`;const prev=prevRef.current[k];const cur=`${e.currentBalance}:${e.creditLimit}`;if(prev&&prev!==cur)changed.add(e.id);prevRef.current[k]=cur;});
+      if(prevRef.current && Object.keys(prevRef.current).length > 0 && changed.size>0)setChangedIds(changed);
+      setCbal(cl);
+    }
     if(Array.isArray(su))setSbal(su);
   },[]);
-  useEffect(()=>{load();},[load]);
+  useEffect(()=>{load();const i=setInterval(load,5000);return()=>clearInterval(i);},[load]);
+  // Clear change highlights after 3 seconds
+  useEffect(()=>{if(changedIds.size>0){const t=setTimeout(()=>setChangedIds(new Set()),3000);return()=>clearTimeout(t);}},[changedIds]);
 
   const sub=async(e:React.FormEvent)=>{e.preventDefault();const res=await api("/api/balance",{method:"PUT",body:JSON.stringify({type:f.type,id:parseInt(f.eid),amount:f.amount,operation:f.op})});if(res.success){alert(`Updated!\nBalance: $${parseFloat(res.newBalance).toFixed(4)}\nCredit: $${parseFloat(res.newCredit).toFixed(4)}\nTotal Available: $${(res.totalAvailable).toFixed(4)}`);setShow(false);load();}else{alert(res.error||"Failed");}};
 
@@ -270,7 +281,7 @@ function BalanceTab() {
   const ents=tab==="clients"?cbal:sbal;
 
   return (<div className="space-y-3">
-    <div className="flex justify-between items-center"><h2 className="text-lg font-bold">💳 Balance & Credit</h2><div className="flex gap-2"><button onClick={()=>{setTab("clients");setF({...f,type:"client"});}} className={`px-3 py-1.5 rounded text-xs ${tab==="clients"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>Clients</button><button onClick={()=>{setTab("suppliers");setF({...f,type:"supplier"});}} className={`px-3 py-1.5 rounded text-xs ${tab==="suppliers"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>Suppliers</button></div></div>
+    <div className="flex justify-between items-center"><h2 className="text-lg font-bold">💳 Balance & Credit <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-600 text-white ml-2 align-middle">Live</span></h2><div className="flex items-center gap-3"><span className="text-[10px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Auto-refresh 5s</span><div className="flex gap-2"><button onClick={()=>{setTab("clients");setF({...f,type:"client"});}} className={`px-3 py-1.5 rounded text-xs ${tab==="clients"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>Clients</button><button onClick={()=>{setTab("suppliers");setF({...f,type:"supplier"});}} className={`px-3 py-1.5 rounded text-xs ${tab==="suppliers"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>Suppliers</button></div></div></div>
 
     <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-[10px] text-gray-500">Total {tab==="clients"?"Client":"Supplier"} Funds</p><p className="text-xl font-bold text-green-400">${tab==="clients"?totalBal.toFixed(4):supTotal.toFixed(4)}</p><p className="text-[9px] text-gray-600">Balance + Credit</p></div>
@@ -288,7 +299,7 @@ function BalanceTab() {
       <button type="submit" className="px-4 py-2 bg-green-600 text-white rounded text-xs">Apply</button>
     </form>)}
 
-    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto"><table className="w-full text-xs"><thead><tr className="text-gray-500 border-b border-gray-800 text-left"><th className="p-3">Name</th><th className="p-3">Balance</th><th className="p-3">Credit</th><th className="p-3">Total Available</th>{tab==="clients"?<><th className="p-3">Spent</th><th className="p-3">Msgs</th><th className="p-3">Billing</th></>:<><th className="p-3">Cost</th><th className="p-3">Msgs</th><th className="p-3">Priority</th></>}<th className="p-3">Actions</th></tr></thead><tbody>{ents.length===0?<tr><td colSpan={tab==="clients"?8:8} className="p-6 text-center text-gray-600">No data</td></tr>:ents.map((e:BalanceEntry)=>{const bal=parseFloat(e.currentBalance||"0");const cred=parseFloat(e.creditLimit||"0");const total=bal+cred;const low=tab==="clients"?total<parseFloat(e.totalSpent||"0"):false;return(<tr key={e.id} className={`border-b border-gray-800/50 ${low?"bg-red-900/10":""}`}><td className="p-3 font-medium">{e.name}</td><td className={`p-3 font-mono font-bold ${bal>0?"text-green-400":"text-gray-500"}`}>${bal.toFixed(4)}</td><td className={`p-3 font-mono font-bold ${cred>0?"text-blue-400":"text-gray-500"}`}>${cred.toFixed(4)}</td><td className={`p-3 font-mono font-bold ${total>0?"text-cyan-400":"text-red-400"}`}>${total.toFixed(4)}</td>{tab==="clients"?<><td className="p-3 text-red-400">${parseFloat(e.totalSpent||"0").toFixed(4)}</td><td className="p-3">{e.totalMessages?.toLocaleString()||0}</td><td className="p-3 text-[10px]">{e.billingType==="on_dlr"?"On DLR":"On Submit"}</td></>:<><td className="p-3 text-red-400">${parseFloat(e.totalCost||"0").toFixed(4)}</td><td className="p-3">{e.totalMessages?.toLocaleString()||0}</td><td className="p-3">{e.priority||1}</td></>}<td className="p-3 flex gap-1"><button onClick={()=>{setF({...f,type:tab==="clients"?"client":"supplier",eid:String(e.id),amount:"",op:"add_balance"});setShow(true);}} className="text-green-400 text-xs">💰</button><button onClick={()=>{setF({...f,type:tab==="clients"?"client":"supplier",eid:String(e.id),amount:"",op:"add_credit"});setShow(true);}} className="text-blue-400 text-xs">💳</button></td></tr>);})}</tbody></table></div></div>);
+    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto"><table className="w-full text-xs"><thead><tr className="text-gray-500 border-b border-gray-800 text-left"><th className="p-3">Name</th><th className="p-3">Balance</th><th className="p-3">Credit</th><th className="p-3">Total Available</th>{tab==="clients"?<><th className="p-3">Spent</th><th className="p-3">Msgs</th><th className="p-3">Billing</th></>:<><th className="p-3">Cost</th><th className="p-3">Msgs</th><th className="p-3">Priority</th></>}<th className="p-3">Actions</th></tr></thead><tbody>{ents.length===0?<tr><td colSpan={tab==="clients"?8:8} className="p-6 text-center text-gray-600">No data</td></tr>:ents.map((e:BalanceEntry)=>{const bal=parseFloat(e.currentBalance||"0");const cred=parseFloat(e.creditLimit||"0");const total=bal+cred;const low=tab==="clients"?total<parseFloat(e.totalSpent||"0"):false;return(<tr key={e.id} className={`border-b border-gray-800/50 ${low?"bg-red-900/10":""} ${changedIds.has(e.id)?"bg-yellow-500/10 transition-colors duration-500":""}`}><td className="p-3 font-medium">{e.name}</td><td className={`p-3 font-mono font-bold ${bal>0?"text-green-400":"text-gray-500"}`}>${bal.toFixed(4)}</td><td className={`p-3 font-mono font-bold ${cred>0?"text-blue-400":"text-gray-500"}`}>${cred.toFixed(4)}</td><td className={`p-3 font-mono font-bold ${total>0?"text-cyan-400":"text-red-400"}`}>${total.toFixed(4)}</td>{tab==="clients"?<><td className="p-3 text-red-400">${parseFloat(e.totalSpent||"0").toFixed(4)}</td><td className="p-3">{e.totalMessages?.toLocaleString()||0}</td><td className="p-3 text-[10px]">{e.billingType==="on_dlr"?"On DLR":"On Submit"}</td></>:<><td className="p-3 text-red-400">${parseFloat(e.totalCost||"0").toFixed(4)}</td><td className="p-3">{e.totalMessages?.toLocaleString()||0}</td><td className="p-3">{e.priority||1}</td></>}<td className="p-3 flex gap-1"><button onClick={()=>{setF({...f,type:tab==="clients"?"client":"supplier",eid:String(e.id),amount:"",op:"add_balance"});setShow(true);}} className="text-green-400 text-xs">💰</button><button onClick={()=>{setF({...f,type:tab==="clients"?"client":"supplier",eid:String(e.id),amount:"",op:"add_credit"});setShow(true);}} className="text-blue-400 text-xs">💳</button></td></tr>);})}</tbody></table></div></div>);
 }
 
 // ── Invoices Tab (with download PDF/Excel) ─────────────
