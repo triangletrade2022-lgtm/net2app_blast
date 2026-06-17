@@ -92,7 +92,7 @@ PG_HBA=$(su - postgres -c "psql -t -c 'SHOW hba_file;'" 2>/dev/null | tr -d ' ')
 if [ -f "$PG_HBA" ]; then
     cp "$PG_HBA" "${PG_HBA}.backup"
     sed -i 's/local\s\+all\s\+all\s\+peer/local   all   all   md5/' "$PG_HBA"
-    systemctl reload postgresql
+    systemctl reload postgresql 2>/dev/null || true
 fi
 
 PGPASSWORD="${DB_PASS}" psql -h 127.0.0.1 -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT 1;" > /dev/null 2>&1 || true
