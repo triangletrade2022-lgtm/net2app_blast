@@ -482,11 +482,21 @@ class DatabaseBridge:
 
     def set_bind_status(self, table, entity_id, status, system_id=None, addr=None, bind_type=None):
         self._execute(f"UPDATE {table} SET smpp_bind_status=%s, updated_at=NOW() WHERE id=%s", (status, entity_id))
+        entity_type = 'client' if table == 'clients' else 'supplier'
+        bt = bind_type or 'transceiver'
+        # Update existing session row
         self._execute(
-            "INSERT INTO smpp_sessions (entity_type, entity_id, system_id, bind_status, bind_type, remote_address, last_activity) "
-            "VALUES (%s,%s,%s,%s,%s,%s,NOW()) "
-            "ON CONFLICT (entity_type, entity_id) DO UPDATE SET bind_status=%s, last_activity=NOW()",
-            ('client' if table == 'clients' else 'supplier', entity_id, system_id, status, bind_type or 'transceiver', addr, status))
+            "UPDATE smpp_sessions SET bind_status=%s, system_id=%s, bind_type=%s, "
+            "remote_address=%s, last_activity=NOW() "
+            "WHERE entity_type=%s AND entity_id=%s",
+            (status, system_id, bt, addr, entity_type, entity_id))
+        # Insert if no row exists yet
+        self._execute(
+            "INSERT INTO smpp_sessions (entity_type, entity_id, system_id, bind_status, "
+            "bind_type, remote_address, last_activity) "
+            "SELECT %s, %s, %s, %s, %s, %s, NOW() "
+            "WHERE NOT EXISTS (SELECT 1 FROM smpp_sessions WHERE entity_type=%s AND entity_id=%s)",
+            (entity_type, entity_id, system_id, status, bt, addr, entity_type, entity_id))
 
     def get_active_smpp_suppliers(self):
         """Fetch all active SMPP suppliers from the database."""
