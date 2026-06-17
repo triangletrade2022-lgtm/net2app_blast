@@ -55,11 +55,11 @@ sudo apt-get install -y postgresql-16 postgresql-client-16
 sudo systemctl enable postgresql
 sudo systemctl start postgresql
 
-# Set postgres superuser password
-sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'Ariyax2024Postgres';"
+# Set postgres superuser password (use your own secure password)
+sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'YOUR_POSTGRES_PASSWORD';"
 
-# Create database and user
-sudo -u postgres psql -c "CREATE USER net2app_user WITH PASSWORD 'Ariyax2024Net2AppDB';"
+# Create database and user (use your own secure passwords)
+sudo -u postgres psql -c "CREATE USER net2app_user WITH PASSWORD 'YOUR_DB_PASSWORD';"
 sudo -u postgres psql -c "CREATE DATABASE net2app_db OWNER net2app_user;"
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE net2app_db TO net2app_user;"
 sudo -u postgres psql -c "ALTER USER net2app_user CREATEDB;"
@@ -69,8 +69,8 @@ PG_HBA=$(sudo -u postgres psql -t -c "SHOW hba_file;" | tr -d ' ')
 sudo sed -i 's/local\s\+all\s\+all\s\+peer/local   all   all   md5/' "$PG_HBA"
 sudo systemctl reload postgresql
 
-# Test connection
-PGPASSWORD='Ariyax2024Net2AppDB' psql -h 127.0.0.1 -U net2app_user -d net2app_db -c "SELECT 1;"
+# Test connection (use the same password you set above)
+PGPASSWORD='YOUR_DB_PASSWORD' psql -h 127.0.0.1 -U net2app_user -d net2app_db -c "SELECT 1;"
 ```
 
 ### Step 5: Create App Directory
@@ -228,7 +228,7 @@ curl http://localhost:3000/api/health
 
 ### Login
 1. Open `http://YOUR_SERVER_IP:3000`
-2. Login as **superuser** / **Telco1988**
+2. Login with the credentials created during database seeding (check your `.env` and seed output)
 
 ### First-Time Setup
 1. Go to **SMTP Config** → Configure your email settings
@@ -286,11 +286,14 @@ The SMSC status page at `/smpp/status` provides a real-time dashboard showing:
 ## 🔄 Database Backup & Restore
 
 ```bash
+# Set your DB password (same as in .env)
+export PGPASSWORD='YOUR_DB_PASSWORD'
+
 # Backup
-PGPASSWORD='Ariyax2024Net2AppDB' pg_dump -U net2app_user -h 127.0.0.1 net2app_db > net2app_backup_$(date +%Y%m%d_%H%M%S).sql
+pg_dump -U net2app_user -h 127.0.0.1 net2app_db > net2app_backup_$(date +%Y%m%d_%H%M%S).sql
 
 # Restore
-PGPASSWORD='Ariyax2024Net2AppDB' psql -U net2app_user -h 127.0.0.1 net2app_db < net2app_backup_YYYYMMDD_HHMMSS.sql
+psql -U net2app_user -h 127.0.0.1 net2app_db < net2app_backup_YYYYMMDD_HHMMSS.sql
 ```
 
 ---
