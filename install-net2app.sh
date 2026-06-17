@@ -137,7 +137,7 @@ echo -e "${YELLOW}[Step 6/14] Copying application files...${NC}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "${SCRIPT_DIR}/package.json" ]; then
     echo "Copying from: ${SCRIPT_DIR}"
-    rsync -av --exclude 'node_modules' --exclude '.next' --exclude '.git' --exclude 'smpp_env' --exclude 'logs' --exclude '*.log' --exclude 'tsconfig.tsbuildinfo' --exclude 'ql -h*' "${SCRIPT_DIR}/" "${APP_DIR}/" > /dev/null 2>&1
+    rsync -av --exclude 'node_modules' --exclude '.next' --exclude '.git' --exclude 'logs' --exclude '*.log' --exclude 'tsconfig.tsbuildinfo' --exclude 'ql -h*' "${SCRIPT_DIR}/" "${APP_DIR}/" > /dev/null 2>&1
 else
     echo -e "${RED}Error: package.json not found. Place this script in the project root.${NC}"
     exit 1
@@ -190,50 +190,24 @@ kill $APP_PID 2>/dev/null || true
 sleep 2
 echo -e "${GREEN}✓ Database seeded (superuser, admin, countries, operators, suppliers)${NC}"
 
-# ── Step 12: Install Python & SMPP Gateway ─────────────
-echo -e "${YELLOW}[Step 12/14] Setting up SMPP gateway (Python)...${NC}"
+# ── Step 12: Install Java & SMSC Gateway ──────────────
+echo -e "${YELLOW}[Step 12/14] Setting up Java SMSC gateway...${NC}"
 
-if ! command -v python3 &> /dev/null; then
-    apt-get install -y -qq python3 python3-pip python3-venv > /dev/null 2>&1
+if ! command -v java &> /dev/null; then
+    apt-get install -y -qq openjdk-21-jre-headless > /dev/null 2>&1
+fi
+echo -e "${GREEN}✓ Java installed${NC}"
+
+# Pre-built JAR is included in the repo — no Maven build needed
+if [ -f "${APP_DIR}/java-smsc-gateway/target/java-smsc-gateway-1.0.0.jar" ]; then
+    echo -e "${GREEN}✓ SMSC gateway JAR found (pre-built)${NC}"
+else
+    echo -e "${RED}Error: SMSC gateway JAR not found at ${APP_DIR}/java-smsc-gateway/target/java-smsc-gateway-1.0.0.jar${NC}"
+    exit 1
 fi
 
-SMPP_VENV="${APP_DIR}/smpp_env"
-python3 -m venv "${SMPP_VENV}" 2>/dev/null || true
-
-source "${SMPP_VENV}/bin/activate"
-pip install smppy smpp.pdu aiohttp psycopg2-binary > /dev/null 2>&1 || true
-deactivate
-
-chown -R "${APP_USER}:${APP_USER}" "${SMPP_VENV}"
-echo -e "${GREEN}✓ Python virtual environment created for SMPP gateway${NC}"
-
-# Create SMPP gateway systemd service
-echo -e "${YELLOW}[Step 12/14] Configuring SMPP gateway (Python venv + systemd service)...${NC}"
-
-cat > /etc/systemd/system/net2app-smpp.service << SMPPSERVICE
-[Unit]
-Description=Net2App Blast SMPP Gateway (ESMC + SMSC)
-After=network.target postgresql.service
-Wants=postgresql.service
-
-[Service]
-Type=simple
-User=${APP_USER}
-WorkingDirectory=${APP_DIR}
-ExecStart=${SMPP_VENV}/bin/python ${APP_DIR}/smpp_gateway/smpp_server.py
-Restart=always
-RestartSec=10
-StandardOutput=append:${APP_DIR}/logs/smpp_server.log
-StandardError=append:${APP_DIR}/logs/smpp_server.log
-
-[Install]
-WantedBy=multi-user.target
-SMPPSERVICE
-
-systemctl daemon-reload
-systemctl enable net2app-smpp
-systemctl start net2app-smpp
-echo -e "${GREEN}✓ SMPP gateway Python environment + systemd service configured and started${NC}"
+chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/java-smsc-gateway"
+echo -e "${GREEN}✓ Java SMSC gateway ready (managed by PM2 via ecosystem.config.js)${NC}"
 
 # ── Step 13: Setup SMSC Monitor Cron ───────────────────
 echo -e "${YELLOW}[Step 13/14] Setting up SMSC monitor cron...${NC}"
@@ -259,9 +233,33 @@ module.exports = {
     env: {
       NODE_ENV: 'production',
       PORT: ${APP_PORT},
+      DATABASE_URL: 'postgresql://${DB_USER}:${DB_PASS}@127.0.0.1:5432/${DB_NAME}',
     },
     error_file: '${APP_DIR}/logs/error.log',
     out_file: '${APP_DIR}/logs/output.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    merge_logs: true,
+  }, {
+    name: 'net2app-smsc',
+    script: 'java-smsc-gateway/target/java-smsc-gateway-1.0.0.jar',
+    interpreter: 'java',
+    interpreter_args: '-jar',
+    cwd: '${APP_DIR}',
+    instances: 1,
+    exec_mode: 'fork',
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '512M',
+    restart_delay: 3000,
+    env: {
+      SMSC_PORT: '2775',
+      API_PORT: '9000',
+      DB_PASS: '${DB_PASS}',
+      DB_URL: 'jdbc:postgresql://127.0.0.1:5432/${DB_NAME}',
+      DB_USER: '${DB_USER}',
+    },
+    error_file: '${APP_DIR}/logs/smpp_error.log',
+    out_file: '${APP_DIR}/logs/smpp_server.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
   }]
@@ -340,10 +338,11 @@ cat > "/home/${APP_USER}/net2app-credentials.txt" << CREDENTIALS
 ║  ├── Superuser:     postgres
 ║  └── Super Pass:    ${DB_SUPERPASS}
 ║
-║  SMPP GATEWAY
+║  SMSC GATEWAY (Java)
 ║  ├── ESMC Port:     2775
 ║  ├── REST API:      127.0.0.1:9000
-║  ├── Service:       systemctl status net2app-smpp
+║  ├── PM2 Service:   pm2 status net2app-smsc
+║  ├── SMSC Logs:     tail -f ${APP_DIR}/logs/smpp_server.log
 ║  └── SMSC Monitor:  tail -f ${APP_DIR}/logs/smsc-monitor.log
 ║
 ║  LOGIN CREDENTIALS
@@ -359,9 +358,9 @@ cat > "/home/${APP_USER}/net2app-credentials.txt" << CREDENTIALS
 ║
 ║  MANAGEMENT COMMANDS
 ║  ├── Restart Web:   pm2 restart net2app-blast
-║  ├── Restart SMPP:  systemctl restart net2app-smpp
+║  ├── Restart SMSC:  pm2 restart net2app-smsc
 ║  ├── Web Logs:      pm2 logs net2app-blast
-║  ├── SMPP Logs:     tail -f ${APP_DIR}/logs/smpp_server.log
+║  ├── SMSC Logs:     tail -f ${APP_DIR}/logs/smpp_server.log
 ║  ├── SMSC Monitor:  tail -f ${APP_DIR}/logs/smsc-monitor.log
 ║  ├── Status Page:   http://${SERVER_IP}:3000/smpp/status
 ║  └── DB Backup:     pg_dump -U ${DB_USER} ${DB_NAME} > backup.sql
@@ -393,8 +392,8 @@ echo -e "  Superuser:  ${GREEN}${SUPERUSER_NAME}${NC} / ${GREEN}${SUPERUSER_PASS
 echo -e "  Admin:      ${GREEN}admin@net2app.com${NC} / ${GREEN}${ADMIN_PASS}${NC}"
 echo ""
 echo -e "${YELLOW}Quick Commands:${NC}"
-echo -e "  ${GREEN}pm2 status${NC}                     # Web app status"
-echo -e "  ${GREEN}systemctl status net2app-smpp${NC}   # SMPP gateway status"
+echo -e "  ${GREEN}pm2 status${NC}                     # All services status"
+echo -e "  ${GREEN}pm2 logs net2app-smsc${NC}            # SMSC gateway logs"
 echo -e "  ${GREEN}tail -f ${APP_DIR}/logs/smsc-monitor.log${NC}  # SMSC monitor"
 echo -e "  ${GREEN}tail -f ${APP_DIR}/logs/smpp_server.log${NC}  # SMPP logs"
 echo ""
