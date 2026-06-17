@@ -78,8 +78,8 @@ echo -e "${GREEN}✓ PostgreSQL installed${NC}"
 # ── Step 4: Configure PostgreSQL ───────────────────────
 echo -e "${YELLOW}[Step 4/14] Configuring PostgreSQL database...${NC}"
 
-systemctl enable postgresql
-systemctl start postgresql
+systemctl enable postgresql 2>/dev/null || true
+systemctl start postgresql 2>/dev/null || pg_ctlcluster 16 main start 2>/dev/null || true
 
 su - postgres -c "psql -c \"ALTER USER postgres WITH PASSWORD '${DB_SUPERPASS}';\" 2>/dev/null" || true
 
