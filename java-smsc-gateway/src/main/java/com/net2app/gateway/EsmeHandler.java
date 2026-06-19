@@ -407,9 +407,10 @@ public class EsmeHandler implements SmppServerHandler {
                 if (dlrLogId < 0) {
                     System.err.println("[DLR:" + supplierName + "] WARNING: logDlrOnly failed for internalId=" + msgIdForEsme);
                 } else {
-                    // Also insert a dlr_queue entry (processed=true) for audit trail + admin retry capability.
-                    // The DB consumer skips processed=true rows, so no duplicate deliver_sm is generated.
-                    smsLogger.logDlrQueueProcessed(dlrLogId, msgIdForEsme, esmeCid, sid, dlrStatus);
+                    // Insert dlr_queue entry as processed=false so the DB DLR Consumer
+                    // can re-push within 2s as a guaranteed-delivery safety net.
+                    // Duplicate deliver_sm is harmless — ESME clients de-duplicate by message ID.
+                    smsLogger.logDlrQueueTracked(dlrLogId, msgIdForEsme, esmeCid, sid, dlrStatus);
                 }
             }
 

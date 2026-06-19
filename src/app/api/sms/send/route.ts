@@ -266,10 +266,12 @@ export async function POST(req: NextRequest) {
     // (async submission, non-HTTP supplier, or API error).
     let messageId = supplierMsgId || generateMessageId();
 
-    // Force DLR fallback — ONLY when supplier accepted (not failed, not already delivered)
-    // Client sees "delivered" but supplier stays "submitted" — client charged, supplier NOT
+    // Force DLR fallback — ONLY when supplier was actually contacted (HTTP with real API URL),
+    // the SMS was accepted (not failed, not already delivered), and force DLR is enabled.
+    // Never override a supplier's explicit failure with a forced "delivered" status.
+    // Skip force DLR entirely when the supplier is SMPP (the Java SMSC handles DLR for those).
     let isForceDlr = false;
-    if (smsStatus !== "failed" && smsStatus !== "delivered" && !deliverResult && (forceDlrParam !== undefined ? forceDlrParam : (client.forceDlr || supplier.forceDlr))) {
+    if (supplier.connectionType === "http" && supplier.apiUrl && smsStatus !== "failed" && smsStatus !== "delivered" && !deliverResult && (forceDlrParam !== undefined ? forceDlrParam : (client.forceDlr || supplier.forceDlr))) {
       dlrStatus = client.forceDlrStatus || supplier.forceDlrStatus || "delivered";
       deliverResult = dlrStatus; deliverTime = new Date();
       isForceDlr = true;

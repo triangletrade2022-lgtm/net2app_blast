@@ -251,10 +251,11 @@ export async function POST(req: NextRequest) {
     // (async submission, non-HTTP supplier, or API error).
     let messageId = supplierMsgId || `TEST-${Date.now()}`;
 
-    // Force DLR fallback — ONLY when supplier accepted the SMS (not failed)
-    // Never override a supplier's explicit failure with a forced "delivered" status
+    // Force DLR fallback — ONLY when supplier accepted the SMS (not failed, not already delivered).
+    // NEVER apply force DLR to testMode messages (they never hit a real supplier).
+    // Never override a supplier's explicit failure with a forced "delivered" status.
     let isForceDlr = false;
-    if (smsStatus !== "failed" && smsStatus !== "delivered" && !deliverResult && (forceDlr !== undefined ? forceDlr : (client.forceDlr || supplier.forceDlr))) {
+    if (!testMode && smsStatus !== "failed" && smsStatus !== "delivered" && !deliverResult && (forceDlr !== undefined ? forceDlr : (client.forceDlr || supplier.forceDlr))) {
       dlrStatus = client.forceDlrStatus || supplier.forceDlrStatus || "delivered";
       deliverResult = dlrStatus; deliverTime = new Date();
       isForceDlr = true;

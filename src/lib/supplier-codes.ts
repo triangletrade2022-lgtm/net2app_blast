@@ -103,5 +103,9 @@ export function isStatusCodeDelivered(
   }
 
   // 3) Empty config or unknown supplier: legacy default.
-  return code === "0" || code === "";
+  //    IMPORTANT: only "0" means delivered. Empty string was previously
+  //    matched (code === "") which caused silent false-positives when
+  //    the supplier response JSON didn't contain the expected field path.
+  //    Empty/null/missing status codes are now ALWAYS treated as failed.
+  return code === "0";
 }

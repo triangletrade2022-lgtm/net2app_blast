@@ -341,18 +341,22 @@ public class SmsLogger {
     }
 
     /**
-     * Insert a dlr_queue entry that is ALREADY marked processed.
-     * Used when the deliver_sm was successfully pushed to the ESME in real-time
-     * — the dlr_queue row serves as an audit trail and enables admin re-push
-     * (via /api/smsc/push-dlrs) without the DB consumer re-firing it.
+     * Insert a dlr_queue entry as UNPROCESSED so the DB DLR Consumer
+     * (which polls every 2s) can retry the deliver_sm push. This is the
+     * guaranteed-delivery safety net: even if the real-time forwardDlr push
+     * succeeds (the PDU was written to the socket), the DB consumer will
+     * re-push a duplicate deliver_sm within 2 seconds. Duplicate DLRs are
+     * harmless per SMPP conventions — the ESME client de-duplicates by
+     * message ID. The duplicate also serves as an audit trail for the admin
+     * /api/smsc/push-dlrs endpoint.
      */
-    public void logDlrQueueProcessed(int smsLogId, String messageId, int clientId,
-                                      int supplierId, String dlrStatus) {
+    public void logDlrQueueTracked(int smsLogId, String messageId, int clientId,
+                                    int supplierId, String dlrStatus) {
         if (supplierId <= 0) return;
         String sql = """
             INSERT INTO dlr_queue (sms_log_id, message_id, client_id, supplier_id,
-                                    dlr_status, direction, processed, processed_at)
-            VALUES (?, ?, ?, ?, ?, 'supplier_to_client', true, NOW())
+                                    dlr_status, direction, processed)
+            VALUES (?, ?, ?, ?, ?, 'supplier_to_client', false)
             """;
         try (Connection conn = connectionProvider.get();
              PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -363,7 +367,7 @@ public class SmsLogger {
             ps.setString(5, dlrStatus);
             ps.executeUpdate();
         } catch (SQLException e) {
-            System.err.println("[SMS-LOG] logDlrQueueProcessed error: " + e.getMessage());
+            System.err.println("[SMS-LOG] logDlrQueueTracked error: " + e.getMessage());
         }
     }
 
