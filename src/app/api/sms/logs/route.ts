@@ -51,13 +51,18 @@ export async function GET(req: NextRequest) {
 
     const offset = (page - 1) * limit;
 
-    // Get total count
-    const [countResult] = await db
-      .select({ count: sql<number>`count(*)::int` })
+    // Get total count + aggregate totals for the filtered dataset (single query)
+    const [stats] = await db
+      .select({
+        count: sql<number>`count(*)::int`,
+        totalCost: sql<string>`COALESCE(sum(cast(${smsLogs.cost} as numeric)), '0')::text`,
+        totalPay: sql<string>`COALESCE(sum(cast(${smsLogs.pay} as numeric)), '0')::text`,
+        totalProfit: sql<string>`COALESCE(sum(cast(${smsLogs.profit} as numeric)), '0')::text`,
+      })
       .from(smsLogs)
       .where(whereClause);
 
-    const total = countResult?.count ?? 0;
+    const total = stats?.count ?? 0;
     const totalPages = Math.ceil(total / limit);
 
     // Get page of logs
@@ -72,6 +77,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       logs,
       total,
+      totalCost: stats?.totalCost || "0",
+      totalPay: stats?.totalPay || "0",
+      totalProfit: stats?.totalProfit || "0",
       page,
       pageSize: limit,
       totalPages,

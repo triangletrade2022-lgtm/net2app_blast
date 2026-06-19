@@ -7,10 +7,20 @@ import java.net.URLEncoder;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.*;
 
 /**
  * Sends SMS via HTTP API for suppliers with connection_type = 'http'.
- * Reads API config (url, key, method, response fields) from the supplier database row.
+ * Reads API config (url, key, method, response fields, delivered-status codes)
+ * from the supplier database row.
+ *
+ * Generalised delivered-status matching (v1.x):
+ *   The legacy "equals(successValue)" match has been replaced with a
+ *   Set<String> deliveredCodes check. Each supplier's convention (SMS Sheba
+ *   = "0", BulkSMS BD = "200", Reve Infobi = "1", etc.) is read from
+ *   `suppliers.delivered_status_codes` JSONB. Empty/null falls back to
+ *   { successValue ?: "0" } so any pre-existing supplier row that hasn't
+ *   been migrated yet still behaves identically to before.
  */
 public class HttpSupplierClient {
 
@@ -21,8 +31,14 @@ public class HttpSupplierClient {
     private final String apiMethod;       // GET or POST
     private final String senderId;        // default sender from supplier config
     private final String successField;    // e.g. "response.0.status"
-    private final String successValue;    // e.g. "0"
     private final String messageIdField;  // e.g. "response.0.id"
+
+    /**
+     * Set of HTTP submit-response status codes that mean "delivered" for
+     * this supplier. Populated from `suppliers.delivered_status_codes` JSONB
+     * (honoured first), falling back to {@link #successValue} when empty.
+     */
+    private final Set<String> deliveredCodes;
 
     private final HttpClient httpClient;
     private final Gson gson;
@@ -30,6 +46,21 @@ public class HttpSupplierClient {
     public HttpSupplierClient(int supplierId, String name, String apiUrl, String apiKey,
                               String apiMethod, String senderId, String successField,
                               String successValue, String messageIdField) {
+        this(supplierId, name, apiUrl, apiKey, apiMethod, senderId,
+             successField, successValue, messageIdField, null);
+    }
+
+    /**
+     * Generalised constructor: caller passes the supplier's own
+     * delivered-status-codes list (parses from `suppliers.delivered_status_codes`
+     * JSONB upstream). When {@code deliveredCodesJson} is null/empty/blank,
+     * the ctor falls back to a Set containing {@code successValue} (or "0")
+     * so legacy behaviour is preserved bit-for-bit.
+     */
+    public HttpSupplierClient(int supplierId, String name, String apiUrl, String apiKey,
+                              String apiMethod, String senderId, String successField,
+                              String successValue, String messageIdField,
+                              String deliveredCodesJson) {
         this.supplierId = supplierId;
         this.name = name;
         this.apiUrl = apiUrl;
@@ -37,12 +68,45 @@ public class HttpSupplierClient {
         this.apiMethod = (apiMethod != null && !apiMethod.isEmpty()) ? apiMethod.toUpperCase() : "GET";
         this.senderId = senderId;
         this.successField = successField;
-        this.successValue = successValue;
         this.messageIdField = messageIdField;
+        this.deliveredCodes = parseDeliveredCodes(deliveredCodesJson, successValue);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
         this.gson = new Gson();
+    }
+
+    /**
+     * Parse {@code deliveredCodesJson} (a JSON array of strings, e.g. {@code ["0"]}
+     * or {@code ["200","201"]}) into a Set<String>. Falls back gracefully:
+     * null/blank/non-array content → Set with {@code successValue} (or "0").
+     * Never returns null — always at least one entry, so {@link #send} can
+     * do an unconditional {@code contains()} check.
+     */
+    static Set<String> parseDeliveredCodes(String deliveredCodesJson, String successValue) {
+        Set<String> out = new LinkedHashSet<>();
+        if (deliveredCodesJson != null && !deliveredCodesJson.isBlank()) {
+            try {
+                JsonElement parsed = JsonParser.parseString(deliveredCodesJson);
+                if (parsed != null && parsed.isJsonArray()) {
+                    for (JsonElement el : parsed.getAsJsonArray()) {
+                        if (el == null || el.isJsonNull()) continue;
+                        // Permit string ("0") and number (0) forms so DB writers
+                        // don't have to coerce either way.
+                        String s = el.isJsonPrimitive() ? el.getAsString() : el.toString();
+                        if (s != null && !s.isEmpty()) out.add(s);
+                    }
+                }
+            } catch (JsonSyntaxException | IllegalStateException e) {
+                System.err.println("[HttpSupplierClient] WARN: delivered_status_codes JSON parse failed ("
+                        + deliveredCodesJson + "): " + e.getMessage() + " — falling back to successValue");
+            }
+        }
+        if (out.isEmpty()) {
+            String fallback = (successValue != null && !successValue.isBlank()) ? successValue : "0";
+            out.add(fallback);
+        }
+        return out;
     }
 
     /**
@@ -89,7 +153,10 @@ public class HttpSupplierClient {
             // Parse JSON and extract success + messageId
             JsonObject json = gson.fromJson(body, JsonObject.class);
             String status = getNestedField(json, successField);
-            boolean success = successValue != null && successValue.equals(status);
+            // Generalised: match against ANY of the supplier's delivered-status codes,
+            // not just a single "successValue". This is what enables Bulk SMS BD
+            // ("200"), Reve Infobi ("1"), SSL Wireless, etc. without changing Java code.
+            boolean success = status != null && deliveredCodes.contains(status);
             String msgId = success ? getNestedField(json, messageIdField) : null;
 
             String error = success ? null : ("status=" + status);
@@ -135,6 +202,8 @@ public class HttpSupplierClient {
 
     public int getSupplierId() { return supplierId; }
     public String getName() { return name; }
+    /** Returns the delivered-status-codes set this client matches against. */
+    public Set<String> getDeliveredCodes() { return deliveredCodes; }
 
     // ── Result record ──
 

@@ -24,6 +24,21 @@ export function isGsm7(text: string): boolean {
   return /^[\x20-\x7E\n\r]*$/.test(text);
 }
 
+/**
+ * Strip characters that PostgreSQL TEXT columns cannot store.
+ *
+ * Postgres rejects 0x00 (NUL) at the encoding converter layer (BEFORE INSERT
+ * triggers fire — the error surfaces as SQLSTATE 22021 character_not_in_repertoire,
+ * not as a domain-level rejection). SMPP short-message payloads frequently carry
+ * NUL bytes for UCS-2 / UDH framing, so we strip them at the API boundary to
+ * prevent the bulk of the writes from ever producing a generic encoding error.
+ *
+ * NUL → space preserves word boundaries for human-readable log output.
+ */
+export function sanitizeSmsText(s: unknown): string {
+  return String(s ?? "").replace(/\x00/g, " ");
+}
+
 export function getSmsEncoding(text: string): "GSM-7" | "UCS-2" {
   return isGsm7(text) ? "GSM-7" : "UCS-2";
 }

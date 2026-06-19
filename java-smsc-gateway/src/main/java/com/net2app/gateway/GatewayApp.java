@@ -55,6 +55,14 @@ public class GatewayApp {
         server.startSync();
         System.out.println("[SMSC] ESME server on port " + smscPort);
 
+        // Graceful shutdown: stop the SupplierManager reconnect thread and tear down clients.
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("[Gateway] Shutdown hook — tearing down suppliers...");
+            supplierManager.stop();
+            try { server.stop(); } catch (Exception ignored) {}
+            System.out.println("[Gateway] Shutdown complete.");
+        }, "smsc-shutdown"));
+
         Thread.currentThread().join();
     }
 

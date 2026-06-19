@@ -172,23 +172,22 @@ export async function GET() {
       });
     }
 
-    // Stale cleanup when at least one gateway responded
-    if (anyOk) {
-      const staleCondition = boundClientIds.size > 0
-        ? and(
-            eq(clients.connectionType, "smpp"),
-            eq(clients.smppBindStatus, "bound"),
-            not(inArray(clients.id, Array.from(boundClientIds))),
-          )
-        : and(
-            eq(clients.connectionType, "smpp"),
-            eq(clients.smppBindStatus, "bound"),
-          );
-
+    // Stale cleanup — only when we have positive evidence of the currently-bound
+    // set. Skipping the cleanup when `boundClientIds` is empty avoids
+    // blanket-flipping every bound SMPP client to "unbound" right after a
+    // gateway restart, before sessions get registered, or any moment the
+    // gateway returns an empty-but-reachable snapshot.
+    if (boundClientIds.size > 0) {
       await db
         .update(clients)
         .set({ smppBindStatus: "unbound", updatedAt: new Date() })
-        .where(staleCondition);
+        .where(
+          and(
+            eq(clients.connectionType, "smpp"),
+            eq(clients.smppBindStatus, "bound"),
+            not(inArray(clients.id, Array.from(boundClientIds))),
+          ),
+        );
     }
 
     // Also include SMPP clients that are unbound
@@ -198,8 +197,7 @@ export async function GET() {
       .where(
         and(
           eq(clients.connectionType, "smpp"),
-          eq(clients.isActive, true),
-          eq(clients.smppBindStatus, "unbound"),
+          eq(clients.isActive, true),            eq(clients.smppBindStatus, "unbound"),
         ),
       );
 

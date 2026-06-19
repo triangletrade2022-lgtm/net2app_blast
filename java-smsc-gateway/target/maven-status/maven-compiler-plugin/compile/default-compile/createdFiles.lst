@@ -5,6 +5,8 @@ com/net2app/gateway/RouteResolver$RouteInfo.class
 com/net2app/gateway/EsmeHandler.class
 com/net2app/gateway/MccMncLookup.class
 com/net2app/gateway/SmsLogger.class
+com/net2app/gateway/ConnectionProvider.class
+com/net2app/gateway/EsmeHandler$PushDlrsResult.class
 com/net2app/gateway/EsmeHandler$ForceDlrConfig.class
 com/net2app/gateway/SupplierClient$1.class
 com/net2app/gateway/EsmeHandler$DlrQueueEntry.class

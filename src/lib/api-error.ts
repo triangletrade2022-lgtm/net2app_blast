@@ -13,6 +13,29 @@ export function handleApiError(e: unknown, context?: string): NextResponse {
   const msg = e instanceof Error ? e.message : "Unknown error";
   const stack = e instanceof Error ? e.stack : undefined;
 
+  // Postgres SQLSTATE 22021 = character_not_in_repertoire (NUL / invalid UTF-8).
+  // Drizzle/node-postgres exposes the SQLSTATE at `error.code`; fall back to
+  // scanning the message for the literal "0x00" / encoding-error fragment so
+  // we still catch it when only the message text is preserved.
+  const pgCode = (e as { code?: string } | null)?.code;
+  const isTextEncodingError =
+    pgCode === "22021" ||
+    (typeof msg === "string" && /invalid byte sequence.+0x00|character_not_in_repertoire/i.test(msg));
+  if (isTextEncodingError) {
+    console.error(
+      `[API Error]${context ? ` [${context}]` : ""} Forbidden 0x00 / invalid UTF-8 in text field (SQLSTATE 22021). raw=${msg}`
+    );
+    return NextResponse.json(
+      {
+        error:
+          "Forbidden character: text field contains 0x00 (NUL byte) or invalid UTF-8. " +
+          "Strip binary framing client-side and retry.",
+        code: "INVALID_TEXT_ENCODING",
+      },
+      { status: 400 }
+    );
+  }
+
   // Log to server console — captured by PM2 in /root/.pm2/logs/ and logs/error.log
   console.error(`[API Error]${context ? ` [${context}]` : ""} ${msg}`);
   if (stack) {

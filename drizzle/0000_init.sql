@@ -419,4 +419,15 @@ ALTER TABLE "sms_logs" ADD CONSTRAINT "sms_logs_operator_id_operators_id_fk" FOR
 ALTER TABLE "supplier_rates" ADD CONSTRAINT "supplier_rates_supplier_id_suppliers_id_fk" FOREIGN KEY ("supplier_id") REFERENCES "public"."suppliers"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "supplier_rates" ADD CONSTRAINT "supplier_rates_country_id_countries_id_fk" FOREIGN KEY ("country_id") REFERENCES "public"."countries"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "supplier_rates" ADD CONSTRAINT "supplier_rates_operator_id_operators_id_fk" FOREIGN KEY ("operator_id") REFERENCES "public"."operators"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+-- 1) Per-supplier delivered-status-codes column: replaces hardcoded SMS_SHEBA_CODES map.
+-- A row in `suppliers` may declare e.g. ["0"] (SMS Sheba), ["200"] (BulkSMS BD), or any subset
+-- of codes that mean "delivered" for THAT supplier's HTTP submit response. The TS layer reads
+-- the array via `(supplier.deliveredStatusCodes as string[])` in /api/sms/send + /api/sms/test,
+-- and the Java SMSC reads it via SupplierManager -> HttpSupplierClient(deliveredCodesJson) -> Set.
+ALTER TABLE "suppliers" ADD COLUMN "delivered_status_codes" jsonb DEFAULT '[]'::jsonb NOT NULL;
+
+-- 2) Seed: preserve SMS Sheba's "0 = delivered" semantics after the upgrade so existing smokes
+-- are not regressed. Add more suppliers' mapping rows in subsequent migrations as they come online.
+UPDATE "suppliers" SET "delivered_status_codes" = '["0"]'::jsonb WHERE "supplier_code" = 'SMSSHEBA';
+
 ALTER TABLE "trunks" ADD CONSTRAINT "trunks_supplier_id_suppliers_id_fk" FOREIGN KEY ("supplier_id") REFERENCES "public"."suppliers"("id") ON DELETE no action ON UPDATE no action;

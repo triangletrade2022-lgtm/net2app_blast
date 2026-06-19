@@ -4,8 +4,8 @@ const cwd = process.cwd();
 module.exports = {
   apps: [{
     name: 'net2app-blast',
-    script: 'node_modules/.bin/next',
-    args: 'start -p 3000',
+    script: 'scripts/next-start.sh',
+    interpreter: 'bash',
     cwd: cwd,
     instances: 1,
     exec_mode: 'fork',

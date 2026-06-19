@@ -55,6 +55,9 @@ jobs:
       - name: TypeScript type check
         run: npm run typecheck
 
+      - name: Run vitest verbose (encoding-math regression)
+        run: npx vitest run --reporter=verbose --passWithNoTests
+
       - name: ESLint
         run: npm run lint
         env:
@@ -104,11 +107,263 @@ jobs:
           bash -n install-net2app.sh
 
   # ────────────────────────────────────────────────────
-  # Notify on failure
+  # Java SMSC gateway: mvn verify (encoding + JDBC-stub suites)
   # ────────────────────────────────────────────────────
+  java-smsc-gateway:
+    name: Java SMSC Gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Run mvn verify (compile + JUnit 5 encoding + JDBC-stub suites)
+        run: mvn -B verify -Dmaven.javadoc.skip=true
+        working-directory: java-smsc-gateway
+
+      - name: Upload surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: java-smsc-gateway/target/surefire-reports/
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────
+  # Java SMSC — live-ESME-bind integration tests (-Pintegration)
+  # ────────────────────────────────────────────────────
+  # Gated to runs on master (deploy-env semantic): the test binds a real
+  # smpp-core 1.0.8 SmppClient against the Java SMSC gateway and
+  # mutates an ephemeral Postgres service with TriangleT seed data.
+  # PR CI VMs don't have a live SMSC, so this job is master-only.
+  # pom.xml's <profile id="integration"> activates surefire's
+  # <groups>integration</groups> via `-Pintegration`, running only the
+  # @Tag("integration") tests. Default unit runs (PRs) skip it via
+  # surefire's <excludedGroups>integration</excludedGroups>.
+  java-smsc-integration:
+    name: Java SMSC Integration Tests (live ESME bind)
+    runs-on: ubuntu-latest
+    needs: java-smsc-gateway
+    if: github.ref == 'refs/heads/master'
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: net2app_db
+          POSTGRES_USER: net2app_user
+          POSTGRES_PASSWORD: ci_integration_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Install Postgres client + nc (for psql seed + port wait)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client netcat-openbsd
+
+      - name: Apply drizzle schema migrations
+        env:
+          PGPASSWORD: ci_integration_password
+        run: |
+          set -e
+          for f in drizzle/0000_init.sql drizzle/0001_dizzy_inertia.sql; do
+            if [ -f "$f" ]; then
+              echo "[schema] applying $f"
+              psql -h localhost -U net2app_user -d net2app_db -v ON_ERROR_STOP=1 -f "$f"
+            fi
+          done
+
+      - name: Seed TriangleT + minimal route/trunk/supplier/client_rate
+        env:
+          PGPASSWORD: ci_integration_password
+        run: |
+          set -e
+          psql -h localhost -U net2app_user -d net2app_db -v ON_ERROR_STOP=1 <<'SQL'
+          -- Minimal supplier (test creates its own mock supplier in @BeforeAll;
+          -- this one is never invoked because the mock route_trunks @ priority=0
+          -- wins via ORDER BY rt.priority ASC LIMIT 1).
+          INSERT INTO suppliers (name, email, connection_type, is_active, billing_type,
+                                api_url, api_method, sender_id,
+                                success_field, success_value, message_id_field,
+                                delivered_status_codes)
+          VALUES ('CI Mock SMS Sheba', 'smssheba@ci.local', 'http', true, 'on_dlr',
+                  'http://127.0.0.1:18080/never-used', 'GET', 'TestSender',
+                  'response.0.status', '0', 'response.0.message_id', '["0"]'::jsonb);
+
+          -- TriangleT — the live ESME client the integration test binds as.
+          -- Pre-flight asserts is_active=true, billing_type='on_submit',
+          -- current_balance+credit_limit >= 0.005 USD.
+          INSERT INTO clients (name, email, smpp_system_id, smpp_password, connection_type,
+                              is_active, force_dlr, billing_type, current_balance, credit_limit)
+          VALUES ('TriangleT', 'triangle@ci.local', 'TriangleT', 'CiPwd2026Net2App', 'smpp',
+                  true, false, 'on_submit', 1000, 100);
+
+          -- One trunk + one route 'CL_Triangle Trade to SMS Sheba' + matching
+          -- route_trunks row so the test's @BeforeAll pre-flight SELECT against
+          -- this name passes.
+          INSERT INTO trunks (name, supplier_id, max_tps, is_active)
+          VALUES ('CI Default Trunk',
+                  (SELECT id FROM suppliers WHERE name='CI Mock SMS Sheba'),
+                  100, true);
+
+          INSERT INTO routes (name, client_id, is_active, priority)
+          VALUES ('CL_Triangle Trade to SMS Sheba',
+                  (SELECT id FROM clients WHERE smpp_system_id='TriangleT'),
+                  true, 1);
+
+          INSERT INTO route_trunks (route_id, trunk_id, supplier_id, priority, is_active)
+          VALUES ((SELECT id FROM routes WHERE name='CL_Triangle Trade to SMS Sheba'),
+                  (SELECT id FROM trunks WHERE name='CI Default Trunk'),
+                  (SELECT id FROM suppliers WHERE name='CI Mock SMS Sheba'),
+                  1, true);
+
+          -- Client rate for mcc_mnc=47001 must exceed the test's mock supplier rate
+          -- (0.003) so RouteResolver.resolve's supplierRate < clientRate margin
+          -- check passes.
+          INSERT INTO client_rates (client_id, mcc_mnc, rate, is_active)
+          VALUES ((SELECT id FROM clients WHERE smpp_system_id='TriangleT'),
+                  '47001', 0.005, true);
+          SQL
+
+      - name: Build SMSC JAR (skip default surefire suites; integration runs separately)
+        working-directory: java-smsc-gateway
+        run: mvn -B package -DskipTests -Dmaven.javadoc.skip=true
+
+      - name: Start Java SMSC gateway in background
+        working-directory: java-smsc-gateway
+        run: |
+          set -a
+          : "${DB_URL:=jdbc:postgresql://localhost:5432/net2app_db}"
+          : "${DB_USER:=net2app_user}"
+          export DB_URL DB_USER DB_PASS='ci_integration_password' SMSC_PORT=2775 API_PORT=9000
+          set +a
+          echo "[smsc] DB_URL=$DB_URL DB_USER=$DB_USER SMSC_PORT=$SMSC_PORT API_PORT=$API_PORT"
+          nohup java -jar target/java-smsc-gateway-1.0.0.jar > /tmp/integration-smsc.log 2>&1 &
+          echo $! > /tmp/integration-smsc.pid
+          echo "[smsc] launched pid=$(cat /tmp/integration-smsc.pid)"
+
+      - name: Wait for SMSC ESME + admin ports + admin health endpoint
+        run: |
+          # Two-stage readiness:
+          #   Stage 1 (≤180s): TCP ports 2775 (ESME) + 9000 (admin REST) — covers
+          #   cold CI runners where Postgres takes a few seconds to become healthy
+          #   and SupplierManager.connectAll() can retry up to 12×5s on DB-not-ready.
+          #   Stage 2 (≤30s): /api/smsc/health returns 200 — confirms Java HttpServer
+          #   bound, SmsLogger constructed, and SupplierManager.connectAll finished
+          #   its initial load pass (either loaded suppliers or hit retry-finished
+          #   + logged warning).
+          #
+          # On failure we dump SMSC log + curl stderr + last health JSON body so
+          # the failure cause is visible in the gh-actions log without re-running
+          # locally.
+          set -euo pipefail
+
+          PORTS_READY=0
+          for i in $(seq 1 180); do
+            if nc -z 127.0.0.1 2775 && nc -z 127.0.0.1 9000; then
+              echo "[smsc] TCP ports ready after ${i}s"
+              PORTS_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$PORTS_READY" != "1" ]; then
+            echo "[smsc] ports never became ready within 180s — tailing SMSC log:"
+            tail -40 /tmp/integration-smsc.log || true
+            exit 1
+          fi
+
+          set +e
+          LAST_HEALTH=000
+          LAST_RC=1
+          for j in $(seq 1 30); do
+            HEALTH=$(curl -sS --max-time 5 -o /tmp/integration-smsc-health.json \
+                        -w '%{http_code}' "http://127.0.0.1:9000/api/smsc/health" \
+                        2>/tmp/integration-smsc-curl.err)
+            RC=$?
+            set -e
+            LAST_HEALTH=$HEALTH
+            LAST_RC=$RC
+            if [ "$HEALTH" = "200" ] && [ "$RC" = "0" ]; then
+              echo "[smsc] /api/smsc/health 200 OK after ${j}s after ports ready"
+              exit 0
+            fi
+            set +e
+            sleep 1
+            set -e
+          done
+
+          echo "[smsc] /api/smsc/health never returned 200 within 30s"
+          echo "[smsc] last curl rc=${LAST_RC} last http_code=${LAST_HEALTH}"
+          echo "[smsc] tailing SMSC log (last 40 lines):"
+          tail -40 /tmp/integration-smsc.log 2>/dev/null || true
+          echo "[smsc] failed /api/smsc/health curl stderr (last 5 lines):"
+          tail -5 /tmp/integration-smsc-curl.err 2>/dev/null || true
+          echo "[smsc] /api/smsc/health response body (first 800 chars):"
+          head -c 800 /tmp/integration-smsc-health.json 2>/dev/null || true
+          echo
+          exit 1
+
+      - name: Run ForceDlrSchedulerIntegrationTest (-Pintegration profile only)
+        working-directory: java-smsc-gateway
+        run: mvn -B test -Dmaven.javadoc.skip=true -Pintegration
+        env:
+          DB_URL: jdbc:postgresql://localhost:5432/net2app_db
+          DB_USER: net2app_user
+          DB_PASS: ci_integration_password
+          SMSC_ADMIN_URL: http://127.0.0.1:9000
+
+      - name: Upload integration surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-integration
+          path: java-smsc-gateway/target/surefire-reports/
+          retention-days: 7
+
+      - name: Stop Java SMSC gateway (best-effort, cleanup always runs)
+        if: always()
+        run: |
+          if [ -f /tmp/integration-smsc.pid ]; then
+            PID=$(cat /tmp/integration-smsc.pid)
+            echo "[smsc] stopping pid=$PID"
+            kill "$PID" 2>/dev/null || true
+            sleep 1
+            kill -9 "$PID" 2>/dev/null || true
+            rm -f /tmp/integration-smsc.pid
+          fi
+
+  # ────────────────────────────────────────────────────
+  # Notify on failure
+  # ───────────────────────────────────────────────────
   summary:
     name: Summary
-    needs: [validate, smpp-gateway]
+    needs: [validate, smpp-gateway, java-smsc-gateway, java-smsc-integration]
     if: always()
     runs-on: ubuntu-latest
 
@@ -117,5 +372,7 @@ jobs:
         run: |
           echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Validate** (typecheck + lint + build): ${{ needs.validate.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Validate** (typecheck + vitest verbose + lint + build): ${{ needs.validate.result }}" >> $GITHUB_STEP_SUMMARY
           echo "- **SMPP Gateway** (ruff + py_compile + bash syntax): ${{ needs.smpp-gateway.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Java SMSC Gateway** (mvn verify: encoding + JDBC-stub suites): ${{ needs.java-smsc-gateway.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Java SMSC Integration** (-Pintegration, master-only live ESME bind): ${{ needs.java-smsc-integration.result }}" >> $GITHUB_STEP_SUMMARY

@@ -102,9 +102,13 @@ public class RouteResolver {
 
         // ── Parts & Billing ──
         int parts = calculateParts(messageText);
-        double cost = round2(supplierRate * parts);
-        double pay = round2(clientRate * parts);
-        double profit = round2(pay - cost);
+        // Use round6 (numeric(10,6) scale) — NOT round2 — so sub-cent SMS
+        // rates (e.g. $0.003 Bangladesh SEA supplier rates) survive the math.
+        // The legacy round2 multiplier of 100.0 zeroed any rate whose cents
+        // component rounded below 0.5 in IEEE-754 (0.003*100=0.29999... → 0).
+        double cost = round6(supplierRate * parts);
+        double pay = round6(clientRate * parts);
+        double profit = round6(pay - cost);
 
         return new RouteInfo(
                 routeId, routeName, trunkId, trunkName,
@@ -171,25 +175,47 @@ public class RouteResolver {
     }
 
     /**
-     * Deduct balance for client and supplier AFTER a successful send.
-     * Only deducts for entities with billing_type = "on_submit".
-     * Call this ONLY after the supplier confirms successful submission.
+     * Deduct balance for client and supplier AFTER a successful send, applying
+     * the unified billing matrix (one charge per SMS — submit-time, DLR-time, or
+     * force-DLR synthetic DLR — never more than once):
+     *
+     * <pre>
+     *   status     │ forceDlr │ client on_submit │ client on_dlr │ supplier on_submit │ supplier on_dlr
+     *   ────────────┼──────────┼──────────────────┼───────────────┼────────────────────┼─────────────────
+     *   failed      │    n/a   │       —          │       —       │        —           │       —
+     *   delivered   │   false  │      charge      │   charge      │       charge       │    charge
+     *   submitted   │   false  │      charge      │   defer→DLR   │       charge       │   defer→DLR
+     *   submitted   │    true  │      charge      │   charge      │       skip         │       skip
+     * </pre>
+     *
+     * <p>For the {@code force-Dlr=true} row the supplier slot is fixed at {@code skip}
+     * because force-DLR is the platform's synthetic marker — the supplier never
+     * confirmed real delivery and is not charged (matches the TypeScript send
+     * route's {@code else if (isForceDlr)} branch).</p>
+     *
+     * <p>For the {@code on_dlr} deferred rows the actual deduction fires later in
+     * {@link #deductAfterDlr(int, int, double, double)} when a real DLR callback
+     * transitions the row from {@code submitted} to {@code delivered}.</p>
+     *
+     * @param supplierChargeable if {@code false}, skip the supplier slot entirely
+     *                            (force-DLR path).
      */
     public boolean deductAfterSuccess(int clientId, int supplierId,
-                                       double pay, double cost) {
+                                       double pay, double cost,
+                                       boolean supplierChargeable) {
         try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
-            // Load current balances for both
+            // Load current balances + billing types for both
             double clientBal = 0, clientCred = 0;
-            boolean clientOnSubmit = false;
+            String clientBillingType = "";
             double supBal = 0, supCred = 0;
-            boolean supOnSubmit = false;
+            String supBillingType = "";
 
             String clientSql = "SELECT current_balance::numeric, credit_limit::numeric, billing_type FROM clients WHERE id = ?";
             try (PreparedStatement ps = conn.prepareStatement(clientSql)) {
                 ps.setInt(1, clientId);
                 ResultSet rs = ps.executeQuery();
                 if (rs.next()) {
-                    clientOnSubmit = "on_submit".equals(rs.getString("billing_type"));
+                    clientBillingType = rs.getString("billing_type");
                     clientBal = toDouble(rs.getBigDecimal("current_balance"));
                     clientCred = toDouble(rs.getBigDecimal("credit_limit"));
                 }
@@ -200,19 +226,83 @@ public class RouteResolver {
                 ps.setInt(1, supplierId);
                 ResultSet rs = ps.executeQuery();
                 if (rs.next()) {
-                    supOnSubmit = "on_submit".equals(rs.getString("billing_type"));
+                    supBillingType = rs.getString("billing_type");
                     supBal = toDouble(rs.getBigDecimal("current_balance"));
                     supCred = toDouble(rs.getBigDecimal("credit_limit"));
                 }
             }
 
-            // Deduct both in same connection
-            if (clientOnSubmit) deductBalance(conn, "clients", clientId, clientBal, clientCred, pay);
-            if (supOnSubmit)   deductBalance(conn, "suppliers", supplierId, supBal, supCred, cost);
+            // Deduct client if on_submit (on_dlr is deferred to deductAfterDlr when real delivery arrives)
+            if ("on_submit".equals(clientBillingType)) {
+                deductBalance(conn, "clients", clientId, clientBal, clientCred, pay);
+            }
+            // Deduct supplier if on_submit AND supplierChargeable (force-DLR ⇒ supplierChargeable=false)
+            if (supplierChargeable && "on_submit".equals(supBillingType)) {
+                deductBalance(conn, "suppliers", supplierId, supBal, supCred, cost);
+            }
 
             return true;
         } catch (SQLException e) {
             System.err.println("[RouteResolver] Deduct error: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Backwards-compatible overload: deduct BOTH on_submit parties (no force-DLR).
+     * Kept as a thin wrapper so existing call sites don't break; new call sites
+     * should pass the explicit force-DLR flag.
+     */
+    public boolean deductAfterSuccess(int clientId, int supplierId,
+                                       double pay, double cost) {
+        return deductAfterSuccess(clientId, supplierId, pay, cost, true);
+    }
+
+    /**
+     * Deferred deduction for {@code billing_type="on_dlr"} entities when a real
+     * DLR callback transitions the row from {@code submitted} to {@code delivered}.
+     * Only entities whose billing_type is {@code on_dlr} are touched; {@code on_submit}
+     * entities were already charged at submit-time by {@link #deductAfterSuccess}.
+     *
+     * <p>Charge semantics: <b>one charge per SMS</b> — this method is the
+     * single point at which on_dlr balances move. Idempotency is enforced by
+     * guarding transitions in the caller; duplicate DLR callbacks (e.g.
+     * supplier retry) that see the row already at {@code delivered} should not
+     * invoke this method a second time.</p>
+     */
+    public boolean deductAfterDlr(int clientId, int supplierId,
+                                   double pay, double cost) {
+        if (clientId <= 0 && supplierId <= 0) return true;  // nothing to do
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {
+            if (clientId > 0) {
+                String clientSql = "SELECT current_balance::numeric, credit_limit::numeric, billing_type FROM clients WHERE id = ?";
+                try (PreparedStatement ps = conn.prepareStatement(clientSql)) {
+                    ps.setInt(1, clientId);
+                    ResultSet rs = ps.executeQuery();
+                    if (rs.next() && "on_dlr".equals(rs.getString("billing_type"))) {
+                        deductBalance(conn, "clients", clientId,
+                                toDouble(rs.getBigDecimal("current_balance")),
+                                toDouble(rs.getBigDecimal("credit_limit")),
+                                pay);
+                    }
+                }
+            }
+            if (supplierId > 0) {
+                String supSql = "SELECT current_balance::numeric, credit_limit::numeric, billing_type FROM suppliers WHERE id = ?";
+                try (PreparedStatement ps = conn.prepareStatement(supSql)) {
+                    ps.setInt(1, supplierId);
+                    ResultSet rs = ps.executeQuery();
+                    if (rs.next() && "on_dlr".equals(rs.getString("billing_type"))) {
+                        deductBalance(conn, "suppliers", supplierId,
+                                toDouble(rs.getBigDecimal("current_balance")),
+                                toDouble(rs.getBigDecimal("credit_limit")),
+                                cost);
+                    }
+                }
+            }
+            return true;
+        } catch (SQLException e) {
+            System.err.println("[RouteResolver] DLR deduct error: " + e.getMessage());
             return false;
         }
     }
@@ -268,12 +358,17 @@ public class RouteResolver {
         String sql = "UPDATE " + table
                 + " SET current_balance = ?, credit_limit = ?, updated_at = NOW() WHERE id = ?";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setBigDecimal(1, BigDecimal.valueOf(round2(newBal)));
-            ps.setBigDecimal(2, BigDecimal.valueOf(round2(newCred)));
+            // Use round4 (numeric(12,4) scale on current_balance / credit_limit)
+            // — balances don't need sub-cent precision and the 4-decimal column
+            // would truncate round6 values anyway. The amount we deduct was
+            // already rounded to scale 6 in the caller (cost/pay); we pass it
+            // through unchanged so the deduction exactly matches the log row.
+            ps.setBigDecimal(1, BigDecimal.valueOf(round4(newBal)));
+            ps.setBigDecimal(2, BigDecimal.valueOf(round4(newCred)));
             ps.setInt(3, entityId);
             ps.executeUpdate();
             System.out.println("[RouteResolver] Deducted " + table + " id=" + entityId
-                    + " amount=" + round2(amount) + " newBal=" + round2(newBal));
+                    + " amount=" + round6(amount) + " newBal=" + round4(newBal));
         } catch (SQLException e) {
             System.err.println("[RouteResolver] Deduct error: " + e.getMessage());
         }
@@ -290,7 +385,27 @@ public class RouteResolver {
         return bd != null ? bd.doubleValue() : 0;
     }
 
-    static double round2(double v) {
-        return Math.round(v * 100.0) / 100.0;
+    // ─── Rounding helpers ──────────────────────────────────────────────────
+    // MUST match the destination Postgres numeric column scale:
+    //   • cost / pay / profit / deduction amounts → numeric(10, 6) → round6
+    //   • current_balance / credit_limit          → numeric(12, 4) → round4
+    //
+    // The legacy `round2(v)` was implemented as `Math.round(v*100)/100`,
+    // which uses Java's floor-based Math.round and therefore silently ZEROES
+    // any sub-cent SMS rate. Concretely, for v = 0.003 USD the IEEE-754
+    // product is 0.29999… which is below 0.5, so Math.round floors to 0 and
+    // the rate becomes 0.0 before insertion. SMS Sheba / similar SEA /
+    // Bangladesh suppliers sit at $0.003 — they were being logged as cost=0
+    // pay=0 even though the route and supplier confirmed delivery.
+    //
+    // Multiplying by 10_000_000.0 (scale-up) puts the integer part at 3 000
+    // instead of 0.3, which Math.round preserves correctly.
+
+    static double round6(double v) {
+        return Math.round(v * 1_000_000.0) / 1_000_000.0;
+    }
+
+    static double round4(double v) {
+        return Math.round(v * 10_000.0) / 10_000.0;
     }
 }

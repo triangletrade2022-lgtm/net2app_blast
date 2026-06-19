@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
+import { usePollingFetch } from "@/lib/hooks/usePollingFetch";
 
 // ── Types ─────────────────────────────────────────────
 interface SupplierStatus {
@@ -374,11 +375,7 @@ export default function SmppStatusPage() {
     }
   }, []);
 
-  useEffect(() => {
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
-    return () => clearInterval(interval);
-  }, [fetchStatus]);
+  usePollingFetch(fetchStatus, 20000);
 
   if (loading && !status) return <LoadingState />;
   if (error && !status) return <ErrorState error={error} onRetry={fetchStatus} />;
@@ -407,7 +404,7 @@ export default function SmppStatusPage() {
               <>
                 <span className="text-[10px] text-gray-500">
                   <span className="inline-block w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse mr-1" />
-                  Auto-refresh
+                  Auto-refresh 20s (paused when tab hidden)
                 </span>
                 <span className="text-xs font-mono text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded">
                   {supplierCounts}

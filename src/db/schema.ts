@@ -150,6 +150,12 @@ export const suppliers = pgTable("suppliers", {
   successValue: varchar("success_value", { length: 100 }),
   messageIdField: varchar("message_id_field", { length: 100 }),
   errorField: varchar("error_field", { length: 100 }),
+  // Per-supplier delivered-status-codes: list of HTTP submit-response status codes
+  // that mean "delivered". Empty array (default) = fall through to the legacy
+  // "0 or empty = delivered" rule in isStatusCodeDelivered(). Set this on each
+  // supplier row to its actual API convention so the system auto-promotes via
+  // submit-response without needing a TS code patch per supplier.
+  deliveredStatusCodes: jsonb("delivered_status_codes").default("[]"),
   // DLR settings
   dlrEnabled: boolean("dlr_enabled").default(true),
   forceDlr: boolean("force_dlr").notNull().default(false),

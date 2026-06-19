@@ -37,6 +37,16 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { entityType, entityId, periodStart, periodEnd, billingType } = body;
 
+    // Runtime validation: reject malformed entityType values early to give a
+    // clearer error response than Postgres' "invalid input value for enum
+    // entity_type" at INSERT time. Accepts only the labels declared in the
+    // Postgres ENUM entity_type: "client" / "supplier".
+    if (!["client", "supplier"].includes(entityType)) {
+      return NextResponse.json(
+        { error: `Invalid entityType: ${JSON.stringify(entityType)} (expected client|supplier)` },
+        { status: 400 }
+      );
+    }
     const start = new Date(periodStart);
     const end = new Date(periodEnd);
 

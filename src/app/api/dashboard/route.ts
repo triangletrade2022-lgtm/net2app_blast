@@ -1,8 +1,9 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { smsLogs, clients, suppliers, smppSessions, license, trunks, routes } from "@/db/schema";
 import { eq, sql, gte } from "drizzle-orm";
 import { handleApiError } from "@/lib/api-error";
+import { requireAdmin } from "@/lib/api-auth";
 
 /** Helper to produce time-window stats: sent count, failed count, cost, pay. */
 async function getTimeWindowStats(minutes: number) {
@@ -17,8 +18,13 @@ async function getTimeWindowStats(minutes: number) {
   return rows[0];
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    // Dashboard is a non-superOnly nav item surfaced to operational admins;
+    // gate on admin-or-above so non-superuser admins see populated panels.
+    if (!requireAdmin(req)) {
+      return NextResponse.json({ error: "Admin access required" }, { status: 403 });
+    }
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
@@ -65,42 +71,45 @@ export async function GET() {
 
     const [lic] = await db.select().from(license).limit(1);
 
-    // Recent SMS logs for dashboard
-    const recentSmpp = await db.select({
-      id: smsLogs.id,
-      messageId: smsLogs.messageId,
-      sender: smsLogs.sender,
-      recipient: smsLogs.recipient,
-      status: smsLogs.status,
-      srcType: smsLogs.srcType,
-      clientUser: smsLogs.clientUser,
-      supplierUser: smsLogs.supplierUser,
-      routeName: smsLogs.routeName,
-      sendResult: smsLogs.sendResult,
-      deliverResult: smsLogs.deliverResult,
-      createdAt: smsLogs.createdAt,
-      connectionType: smsLogs.connectionType,
+    // ── Supplier-wise delivered summary ──
+    const supplierSummary = await db.select({
+      supplierId: smsLogs.supplierId,
+      name: suppliers.name,
+      delivered: sql<number>`count(*)::int`,
+      cost: sql<string>`COALESCE(sum(cast(${smsLogs.cost} as numeric)), 0)::text`,
+      pay: sql<string>`COALESCE(sum(cast(${smsLogs.pay} as numeric)), 0)::text`,
+      profit: sql<string>`COALESCE(sum(cast(${smsLogs.profit} as numeric)), 0)::text`,
     }).from(smsLogs)
-      .where(eq(smsLogs.connectionType, "smpp"))
-      .orderBy(sql`${smsLogs.createdAt} desc`).limit(10);
+      .leftJoin(suppliers, eq(smsLogs.supplierId, suppliers.id))
+      .where(eq(smsLogs.status, "delivered"))
+      .groupBy(smsLogs.supplierId, suppliers.name)
+      .orderBy(sql`count(*) desc`);
 
-    const recentHttp = await db.select({
-      id: smsLogs.id,
-      messageId: smsLogs.messageId,
-      sender: smsLogs.sender,
-      recipient: smsLogs.recipient,
-      status: smsLogs.status,
-      srcType: smsLogs.srcType,
-      clientUser: smsLogs.clientUser,
-      supplierUser: smsLogs.supplierUser,
-      routeName: smsLogs.routeName,
-      sendResult: smsLogs.sendResult,
-      deliverResult: smsLogs.deliverResult,
-      createdAt: smsLogs.createdAt,
-      connectionType: smsLogs.connectionType,
+    // ── Client-wise delivered summary ──
+    const clientSummary = await db.select({
+      clientId: smsLogs.clientId,
+      name: clients.name,
+      delivered: sql<number>`count(*)::int`,
+      cost: sql<string>`COALESCE(sum(cast(${smsLogs.cost} as numeric)), 0)::text`,
+      pay: sql<string>`COALESCE(sum(cast(${smsLogs.pay} as numeric)), 0)::text`,
+      profit: sql<string>`COALESCE(sum(cast(${smsLogs.profit} as numeric)), 0)::text`,
     }).from(smsLogs)
-      .where(eq(smsLogs.connectionType, "http"))
-      .orderBy(sql`${smsLogs.createdAt} desc`).limit(10);
+      .leftJoin(clients, eq(smsLogs.clientId, clients.id))
+      .where(eq(smsLogs.status, "delivered"))
+      .groupBy(smsLogs.clientId, clients.name)
+      .orderBy(sql`count(*) desc`);
+
+    // ── Route-wise delivered summary ──
+    const routeSummary = await db.select({
+      routeName: smsLogs.routeName,
+      delivered: sql<number>`count(*)::int`,
+      cost: sql<string>`COALESCE(sum(cast(${smsLogs.cost} as numeric)), 0)::text`,
+      pay: sql<string>`COALESCE(sum(cast(${smsLogs.pay} as numeric)), 0)::text`,
+      profit: sql<string>`COALESCE(sum(cast(${smsLogs.profit} as numeric)), 0)::text`,
+    }).from(smsLogs)
+      .where(eq(smsLogs.status, "delivered"))
+      .groupBy(smsLogs.routeName)
+      .orderBy(sql`count(*) desc`);
 
     // Hourly stats for today
     const hourlyStats = await db.select({
@@ -126,8 +135,9 @@ export async function GET() {
       cost: cost.total,
       profit: profitTotal.total,
       license: lic || null,
-      recentSmpp,
-      recentHttp,
+      supplierSummary,
+      clientSummary,
+      routeSummary,
       hourlyStats,
       timeWindows,
     });

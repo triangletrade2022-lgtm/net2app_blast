@@ -1,17 +1,28 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { smsLogs, clients, suppliers, routes, routeTrunks, trunks, clientRates, supplierRates, license, operators, dlrQueue } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
-import { generateMessageId, calculateSmsParts, getSmsByteSize, getSmsEncoding } from "@/lib/helpers";
+import { eq, and, sql } from "drizzle-orm";
+import { generateMessageId, calculateSmsParts, getSmsByteSize, getSmsEncoding, sanitizeSmsText } from "@/lib/helpers";
 import { handleApiError } from "@/lib/api-error";
 import {
   isStatusCodeDelivered,
   getSupplierStatusDescription,
 } from "@/lib/supplier-codes";
 
+// Prefix-aware BTRC operator assignment (MCC=470). Mirrors
+// java-smsc-gateway/src/main/java/com/net2app/gateway/MccMncLookup.java.
+// Order significant: Airtel has two prefixes (014, 016); each must match
+// BEFORE any generic 880 rule so a longer-prefix walk can't be misrouted.
 function getMccMnc(recipient: string): { mcc: string; mnc: string; mccMnc: string } {
   const c = recipient.replace(/^00/, "").replace(/^\+/, "");
-  if (c.startsWith("880")) return { mcc: "470", mnc: "01", mccMnc: "47001" };
+  if (c.startsWith("880")) {
+    if (c.startsWith("88013") || c.startsWith("88017")) return { mcc: "470", mnc: "01", mccMnc: "47001" }; // GP (Grameenphone)
+    if (c.startsWith("88014") || c.startsWith("88016")) return { mcc: "470", mnc: "07", mccMnc: "47007" }; // Airtel (incl. Warid)
+    if (c.startsWith("88015")) return { mcc: "470", mnc: "05", mccMnc: "47005" }; // Teletalk
+    if (c.startsWith("88018")) return { mcc: "470", mnc: "02", mccMnc: "47002" }; // Robi (Axiata)
+    if (c.startsWith("88019")) return { mcc: "470", mnc: "03", mccMnc: "47003" }; // Banglalink
+    return { mcc: "470", mnc: "01", mccMnc: "47001" }; // Default fallback for unallocated 880 prefix
+  }
   if (c.startsWith("91")) return { mcc: "404", mnc: "68", mccMnc: "40468" };
   if (c.startsWith("251")) return { mcc: "636", mnc: "01", mccMnc: "63601" };
   if (c.startsWith("1")) return { mcc: "310", mnc: "410", mccMnc: "310410" };
@@ -20,22 +31,46 @@ function getMccMnc(recipient: string): { mcc: string; mnc: string; mccMnc: strin
   return { mcc: "", mnc: "", mccMnc: "" };
 }
 
+/**
+ * Dot-path extractor for HTTP submit-response JSON. Supplier rows configure
+ * `successField` and `messageIdField` (e.g. "response.0.status" for SMS Sheba,
+ * "response_code" for BulkSMS BD, etc.); this honours them so non-default
+ * response shapes parse correctly. Returns undefined when the path
+ * traverses through a null/missing node — callers should fall through to
+ * their default/legacy extraction or hard-fail the row.
+ */
+function getNestedField(obj: unknown, path: string): unknown {
+  return path
+    .split(".")
+    .reduce((acc: any, part) => (acc != null ? acc[part] : undefined), obj);
+}
+
+async function logRejected(params: { clientId: number; supplierId?: number | null; sender: string; recipient: string; text: string; reason: string; ipAddress: string; }) { params.text = sanitizeSmsText(params.text); try { const smsBytes = getSmsByteSize(params.text || ""); const parts = calculateSmsParts(params.text || ""); await db.insert(smsLogs).values({ messageId: generateMessageId(), clientId: params.clientId, supplierId: params.supplierId || null, sender: params.sender || "Net2App", oriReceiver: params.recipient, recipient: params.recipient, dstReceiver: params.recipient.replace(/^00/, "").replace(/^\+/, ""), messageText: params.text, destSms: params.text, smsBytes, destSmsBytes: smsBytes, parts, chargedPoints: 0, status: "rejected", sendResult: "failed", sendReason: params.reason, direction: "mt", ipAddress: params.ipAddress, submitFail: 1, sendTime: new Date(), connectionType: "http", }); } catch (err) { /* silently continue */ } }
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { sender, recipient, messageText, clientId, routeId, forceDlr, testMode } = body;
+    const { sender, recipient, messageText: rawMessageText, clientId, routeId, forceDlr, testMode } = body;
+    // Strip 0x00 bytes (SMPP UCS-2/UDH framing). Postgres TEXT cannot store NUL — sanitize at the API
+    // boundary rather than relying on the 22021 error handler alone. All `messageText` refs below are sanitized.
+    const messageText = sanitizeSmsText(rawMessageText);
     const clientIp = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || "127.0.0.1";
 
     const [client] = await db.select().from(clients).where(eq(clients.id, parseInt(clientId))).limit(1);
     if (!client) return NextResponse.json({ error: "Client not found" }, { status: 400 });
-    if (!client.isActive) return NextResponse.json({ error: "Client inactive" }, { status: 403 });
+    if (!client.isActive) {
+      await logRejected({ clientId: client.id, sender, recipient, text: messageText, reason: "Client inactive", ipAddress: clientIp });
+      return NextResponse.json({ error: "Client inactive" }, { status: 403 });
+    }
 
     const [lic] = await db.select().from(license).limit(1);
     if (!lic || !lic.isActive) {
+      await logRejected({ clientId: client.id, sender, recipient, text: messageText, reason: "License inactive", ipAddress: clientIp });
       return NextResponse.json({ error: "License inactive" }, { status: 403 });
     }
     if (lic.maxVolume && lic.currentUsage !== null && lic.currentUsage >= lic.maxVolume) {
-      return NextResponse.json({ error: `Volume exceeded (${lic.maxVolume.toLocaleString()})` }, { status: 403 });
+      await logRejected({ clientId: client.id, sender, recipient, text: messageText, reason: "Volume exhausted", ipAddress: clientIp });
+      return NextResponse.json({ error: "Volume exhausted. Contact admin for more volume." }, { status: 403 });
     }
 
     const { mcc, mnc, mccMnc } = getMccMnc(recipient);
@@ -48,6 +83,7 @@ export async function POST(req: NextRequest) {
     const [cr2] = !cr1 ? await db.select().from(clientRates).where(and(eq(clientRates.clientId, client.id), eq(clientRates.isActive, true))).limit(1) : [cr1];
 
     if (!cr2) {
+      await logRejected({ clientId: client.id, sender, recipient, text: messageText, reason: `No client rate for ${mccMnc}`, ipAddress: clientIp });
       return NextResponse.json({
         error: "No client rate",
         rateError: `Client "${client.name}" has no rate for MCC-MNC ${mccMnc || "unknown"}. Add a client rate first.`,
@@ -82,7 +118,10 @@ export async function POST(req: NextRequest) {
       const [firstSupplier] = await db.select().from(suppliers).where(eq(suppliers.isActive, true)).limit(1);
       supplier = firstSupplier;
     }
-    if (!supplier) return NextResponse.json({ error: "No active supplier" }, { status: 400 });
+    if (!supplier) {
+      await logRejected({ clientId: client.id, sender, recipient, text: messageText, reason: "No active supplier", ipAddress: clientIp });
+      return NextResponse.json({ error: "No active supplier" }, { status: 400 });
+    }
 
     // Supplier rate
     let supplierRateVal = 0;
@@ -91,6 +130,7 @@ export async function POST(req: NextRequest) {
       : [null];
     const [sr2] = !sr1 ? await db.select().from(supplierRates).where(and(eq(supplierRates.supplierId, supplier.id), eq(supplierRates.isActive, true))).limit(1) : [sr1];
     if (!sr2) {
+      await logRejected({ clientId: client.id, supplierId: supplier.id, sender, recipient, text: messageText, reason: `No supplier rate for ${mccMnc}`, ipAddress: clientIp });
       return NextResponse.json({
         error: "No supplier rate",
         rateError: `Supplier "${supplier.name}" has no rate for MCC-MNC ${mccMnc || "unknown"}. Add a supplier rate.`,
@@ -99,6 +139,7 @@ export async function POST(req: NextRequest) {
     supplierRateVal = parseFloat(sr2.rate) || 0;
 
     if (supplierRateVal >= clientRateVal) {
+      await logRejected({ clientId: client.id, supplierId: supplier.id, sender, recipient, text: messageText, reason: `Supplier rate (${supplierRateVal.toFixed(6)}) >= client rate (${clientRateVal.toFixed(6)})`, ipAddress: clientIp });
       return NextResponse.json({
         error: "Rate validation failed",
         rateError: `Supplier rate (${supplierRateVal.toFixed(6)}) >= client rate (${clientRateVal.toFixed(6)}). SMS blocked to prevent loss.`,
@@ -117,6 +158,7 @@ export async function POST(req: NextRequest) {
     const totalClientAvailable = clientBalance + clientCredit;
 
     if (client.billingType === "on_submit" && totalClientAvailable < pay) {
+      await logRejected({ clientId: client.id, supplierId: supplier.id, sender, recipient, text: messageText, reason: "Insufficient client balance/credit", ipAddress: clientIp });
       return NextResponse.json({
         error: "Insufficient balance",
         rateError: `Client "${client.name}" has $${totalClientAvailable.toFixed(4)} (Balance: $${clientBalance.toFixed(4)} + Credit: $${clientCredit.toFixed(4)}) but needs $${pay.toFixed(6)}. Please top-up balance or credit.`,
@@ -128,6 +170,7 @@ export async function POST(req: NextRequest) {
     const totalSupplierAvailable = supplierBalance + supplierCredit;
 
     if (supplier.billingType === "on_submit" && totalSupplierAvailable < cost) {
+      await logRejected({ clientId: client.id, supplierId: supplier.id, sender, recipient, text: messageText, reason: "Supplier insufficient balance/credit", ipAddress: clientIp });
       return NextResponse.json({
         error: "Supplier insufficient balance",
         rateError: `Supplier "${supplier.name}" has $${totalSupplierAvailable.toFixed(4)} (Balance: $${supplierBalance.toFixed(4)} + Credit: $${supplierCredit.toFixed(4)}) but cost is $${cost.toFixed(6)}.`,
@@ -135,7 +178,6 @@ export async function POST(req: NextRequest) {
     }
 
     // ═══ SEND ═══
-    const messageId = generateMessageId();
     const inMsgId = Date.now().toString();
     const smsBytes = getSmsByteSize(messageText || "");
     const sendTime = new Date();
@@ -157,28 +199,57 @@ export async function POST(req: NextRequest) {
         url.searchParams.set("smstext", messageText || "Test SMS");
         const resp = await fetch(url.toString());
         const data = await resp.json();
-        if (data.response && data.response[0]) {
-          const statusCode = String(data.response[0].status);
-          supplierMsgId = String(data.response[0].id || "");
-          outMsgId = supplierMsgId;
 
-          // Map supplier status code to delivery result
-          const delivered = isStatusCodeDelivered(supplier.supplierCode, statusCode);
-          if (delivered) {
-            smsStatus = "delivered";
-            sendResult = "success";
-            sendReason = "success";
-            deliverResult = "delivered";
-            dlrStatus = "delivered";
-            deliverTime = new Date();
-          } else {
-            smsStatus = "failed";
-            sendResult = "failed";
-            sendReason = getSupplierStatusDescription(supplier.supplierCode, statusCode);
-          }
+        // ── Robust HTTP submit response parsing (regression fix) ──
+        // Honour the supplier's per-row `successField` / `messageIdField` config.
+        // Mirrors the fix in /api/sms/send/route.ts — the previous hardcoded
+        // `data.response[0]` block silently fell through on non-SMS-Sheba response
+        // shapes, charging clients for supplier-rejected sends (e.g. SMS Sheba
+        // 102 "invalid sender id"). Now: always drive delivered-or-failed from
+        // the configured successField; hard-fail with friendly description when
+        // the status code isn't in `delivered_status_codes`.
+        const statusCode = String(
+          getNestedField(data, supplier.successField ?? "response.0.status") ?? ""
+        );
+        const parsedMsgId = String(
+          getNestedField(data, supplier.messageIdField ?? "response.0.id") ?? ""
+        );
+        if (parsedMsgId) {
+          supplierMsgId = parsedMsgId;
+          outMsgId = parsedMsgId;
+        }
+        // messageId resolved after try/catch from supplierMsgId (consistent with SMPP path)
+
+        // 3-arg form: per-supplier delivered_status_codes JSONB drives the mapping.
+        // Empty array falls through to the legacy BD default (0/"" → delivered) per supplier-codes.ts.
+        const delivered = isStatusCodeDelivered(
+          supplier.supplierCode,
+          statusCode,
+          (supplier.deliveredStatusCodes as string[]) || [],
+        );
+        if (delivered) {
+          smsStatus = "delivered";
+          sendResult = "success";
+          sendReason = "success";
+          deliverResult = "delivered";
+          dlrStatus = "delivered";
+          deliverTime = new Date();
+        } else {
+          // Regression fix: SMS Sheba 102 / any non-0 code hard-fails here.
+          smsStatus = "failed";
+          sendResult = "failed";
+          // 3-arg form: per-supplier errorCodes map (future-proofed for the JSONB column
+          // pass-through once `error_status_codes` is added to suppliers). Empty {} = generic
+          // "status: X" fallback.
+          sendReason = getSupplierStatusDescription(supplier.supplierCode, statusCode);
         }
       } catch (err) { smsStatus = "failed"; sendResult = "failed"; sendReason = err instanceof Error ? err.message : "API error"; }
     } else { outMsgId = `TEST-${Date.now()}`; supplierMsgId = outMsgId; }
+
+    // ── Message ID: prefer supplier's ID (consistent format with SMPP path).
+    // Only generate N2A-format fallback when supplier didn't return an ID
+    // (async submission, non-HTTP supplier, or API error).
+    let messageId = supplierMsgId || `TEST-${Date.now()}`;
 
     // Force DLR fallback — ONLY when supplier accepted the SMS (not failed)
     // Never override a supplier's explicit failure with a forced "delivered" status
@@ -189,75 +260,57 @@ export async function POST(req: NextRequest) {
       isForceDlr = true;
     }
 
-    // ═══ BALANCE DEDUCTION ═══
-    // Real delivery (supplier confirmed): charge BOTH client and supplier
-    // Force DLR (supplier only submitted, not delivered): charge CLIENT ONLY
-    // Failed: charge nobody
-    if (smsStatus === "delivered") {
-      // Real supplier delivery — charge both
-      if (client.billingType === "on_submit") {
-        let remaining = pay;
-        let newClientBalance = clientBalance;
-        let newClientCredit = clientCredit;
+    // ═══ UNIFIED BALANCE DEDUCTION (single charge per SMS) ═══
+    // Mirrors java-smsc-gateway RouteResolver.deductAfterSuccess / deductAfterDlr
+    // and src/app/api/sms/send. The matrix below is the source of truth — kept in
+    // sync with the Java EsmeHandler.handleSmppSubmit deduction block.
+    const isFailed = smsStatus === "failed";
+    const isRealDelivered = smsStatus === "delivered";
+    const forceDlrActive = isForceDlr;
+    const chargeClient = !isFailed && (
+      client.billingType === "on_submit"
+      || (client.billingType === "on_dlr" && (isRealDelivered || forceDlrActive))
+    );
+    const chargeSupplier = !isFailed && !forceDlrActive && (
+      supplier.billingType === "on_submit"
+      || (supplier.billingType === "on_dlr" && isRealDelivered)
+    );
 
-        if (newClientBalance >= remaining) {
-          newClientBalance -= remaining;
-          remaining = 0;
-        } else {
-          remaining -= newClientBalance;
-          newClientBalance = 0;
-          newClientCredit = Math.max(0, newClientCredit - remaining);
-        }
-
-        await db.update(clients).set({
-          currentBalance: String(newClientBalance),
-          creditLimit: String(newClientCredit),
-          updatedAt: new Date(),
-        }).where(eq(clients.id, client.id));
+    if (chargeClient) {
+      let remaining = pay;
+      let newClientBalance = clientBalance;
+      let newClientCredit = clientCredit;
+      if (newClientBalance >= remaining) {
+        newClientBalance -= remaining;
+        remaining = 0;
+      } else {
+        remaining -= newClientBalance;
+        newClientBalance = 0;
+        newClientCredit = Math.max(0, newClientCredit - remaining);
       }
+      await db.update(clients).set({
+        currentBalance: String(newClientBalance),
+        creditLimit: String(newClientCredit),
+        updatedAt: new Date(),
+      }).where(eq(clients.id, client.id));
+    }
 
-      if (supplier.billingType === "on_submit") {
-        let remaining = cost;
-        let newSupBalance = supplierBalance;
-        let newSupCredit = supplierCredit;
-
-        if (newSupBalance >= remaining) {
-          newSupBalance -= remaining;
-        } else {
-          remaining -= newSupBalance;
-          newSupBalance = 0;
-          newSupCredit = Math.max(0, newSupCredit - remaining);
-        }
-
-        await db.update(suppliers).set({
-          currentBalance: String(newSupBalance),
-          creditLimit: String(newSupCredit),
-          updatedAt: new Date(),
-        }).where(eq(suppliers.id, supplier.id));
+    if (chargeSupplier) {
+      let remaining = cost;
+      let newSupBalance = supplierBalance;
+      let newSupCredit = supplierCredit;
+      if (newSupBalance >= remaining) {
+        newSupBalance -= remaining;
+      } else {
+        remaining -= newSupBalance;
+        newSupBalance = 0;
+        newSupCredit = Math.max(0, newSupCredit - remaining);
       }
-    } else if (isForceDlr) {
-      // Force DLR: supplier submitted but not delivered — charge CLIENT ONLY
-      if (client.billingType === "on_submit") {
-        let remaining = pay;
-        let newClientBalance = clientBalance;
-        let newClientCredit = clientCredit;
-
-        if (newClientBalance >= remaining) {
-          newClientBalance -= remaining;
-          remaining = 0;
-        } else {
-          remaining -= newClientBalance;
-          newClientBalance = 0;
-          newClientCredit = Math.max(0, newClientCredit - remaining);
-        }
-
-        await db.update(clients).set({
-          currentBalance: String(newClientBalance),
-          creditLimit: String(newClientCredit),
-          updatedAt: new Date(),
-        }).where(eq(clients.id, client.id));
-      }
-      // Supplier NOT charged — platform keeps the margin
+      await db.update(suppliers).set({
+        currentBalance: String(newSupBalance),
+        creditLimit: String(newSupCredit),
+        updatedAt: new Date(),
+      }).where(eq(suppliers.id, supplier.id));
     }
 
     // Final status: if supplier explicitly failed, status is ALWAYS failed
@@ -294,7 +347,7 @@ export async function POST(req: NextRequest) {
 
     // Only count toward license volume if SMS was not failed
     if (lic && finalStatus !== "failed") {
-      await db.update(license).set({ currentUsage: (lic.currentUsage || 0) + parts, updatedAt: new Date() }).where(eq(license.id, lic.id));
+      await db.update(license).set({ currentUsage: sql`COALESCE(${license.currentUsage}, 0) + 1`, updatedAt: new Date() }).where(eq(license.id, lic.id));
     }
     if (dlrStatus) await db.insert(dlrQueue).values({ smsLogId: log.id, messageId, clientId: client.id, supplierId: supplier.id, dlrStatus, direction: "supplier_to_client" });
 

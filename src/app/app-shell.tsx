@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { usePollingFetch } from "@/lib/hooks/usePollingFetch";
 
 // Types
 interface User { id: number; email: string; username?: string; name: string; role: string; permissions?: unknown; lastLogin?: string; lastLoginIp?: string; }
@@ -14,7 +15,7 @@ interface RouteTrunk { id: number; routeId: number; trunkId: number; supplierId:
 interface SmsLog { id: number; messageId: string; clientId?: number; clientUser?: string; msgType?: string; srcType?: string; supplierId?: number; supplierUser?: string; routeId?: number; routeName?: string; channel?: string; device?: string; sender?: string; recipient: string; messageText?: string; parts?: number; status: string; submitSuccess?: number; submitFail?: number; deliverSuccess?: number; deliverFail?: number; sendResult?: string; sendReason?: string; deliverResult?: string; deliverFailReason?: string; dlrStatus?: string; mcc?: string; mnc?: string; inMsgId?: string; outMsgId?: string; clientRate?: string; supplierRate?: string; cost?: string; pay?: string; profit?: string; sendTime?: string; deliverTime?: string; doneTime?: string; duration?: number; deliverDuration?: number; connectionType?: string; ipAddress?: string; clientName?: string; supplierName?: string; createdAt: string; }
 interface Invoice { id: number; invoiceNumber: string; entityType: string; entityId: number; entityName?: string; periodStart: string; periodEnd: string; totalMessages?: number; totalAmount?: string; status?: string; billingType?: string; createdAt: string; }
 interface SmppSession { id: number; entityType: string; entityId: number; systemId?: string; bindStatus?: string; bindType?: string; remoteAddress?: string; entityName?: string; lastActivity?: string; }
-interface DashboardData { totalSms: number; todaySms: number; deliveredSms: number; failedSms: number; submittedSms: number; totalClients: number; totalSuppliers: number; totalTrunks: number; totalRoutes: number; activeSessions: number; revenue: string; cost: string; profit: string; license: { maxVolume?: number; currentUsage?: number } | null; recentSmpp: SmsLog[]; recentHttp: SmsLog[]; hourlyStats: { hour: number; count: number }[]; timeWindows: Record<string, { sent: number; failed: number; cost: string; pay: string }>; }
+interface DashboardData { totalSms: number; todaySms: number; deliveredSms: number; failedSms: number; submittedSms: number; totalClients: number; totalSuppliers: number; totalTrunks: number; totalRoutes: number; activeSessions: number; revenue: string; cost: string; profit: string; license: { maxVolume?: number; currentUsage?: number } | null; supplierSummary: { supplierId: number; name: string; delivered: number; cost: string; pay: string; profit: string }[]; clientSummary: { clientId: number; name: string; delivered: number; cost: string; pay: string; profit: string }[]; routeSummary: { routeName: string; delivered: number; cost: string; pay: string; profit: string }[]; hourlyStats: { hour: number; count: number }[]; timeWindows: Record<string, { sent: number; failed: number; cost: string; pay: string }>; }
 interface SmtpData { host: string; port: number; secure: boolean; username: string; password: string; fromEmail: string; fromName: string; }
 interface ApiProvider { id: number; name: string; code?: string; apiUrl: string; apiMethod?: string; apiKeyParam?: string; apiKeyValue?: string; isActive: boolean; }
 interface BalanceEntry { id: number; name: string; email: string; currentBalance?: string; creditLimit?: string; totalSpent?: string; totalCost?: string; totalMessages?: number; billingType?: string; isActive: boolean; priority?: number; }
@@ -26,9 +27,28 @@ const api = async (url: string, opts?: RequestInit) => {
   const headers: Record<string, string> = {};
   if (!opts?.body || !(opts.body instanceof FormData)) headers["Content-Type"] = "application/json";
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(url, { ...opts, headers: { ...headers, ...opts?.headers } });
-  if (res.headers.get("content-type")?.includes("text/csv") || res.headers.get("content-type")?.includes("application/pdf")) return res.blob();
-  return res.json();
+  let res: Response;
+  try {
+    res = await fetch(url, { ...opts, headers: { ...headers, ...opts?.headers } });
+  } catch (err) {
+    // Network error — coerce to null so callers' `Array.isArray(d)` /
+    // `d?.error` checks (Dashboard, Clients, Rates useEffects, etc.)
+    // don't crash on transient failures. Surface a dev-only warning so
+    // silent network failures stay debuggable from the browser console.
+    if (process.env.NODE_ENV !== "production") console.warn("[api] net err", url, String(err));
+    return null;
+  }
+  if (res.status === 204) return null;
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("text/csv") || ct.includes("application/pdf")) return res.blob();
+  try {
+    return await res.json();
+  } catch (err) {
+    // Body was empty or non-JSON (e.g. upstream 502 with empty body) —
+    // surface as null instead of bubbling a SyntaxError out of useEffect chains.
+    if (process.env.NODE_ENV !== "production") console.warn("[api] empty/non-JSON body", url, res?.status, String(err));
+    return null;
+  }
 };
 
 // ── Login ──────────────────────────────────────────────
@@ -37,7 +57,7 @@ function LoginPage({ onLogin }: { onLogin: (u: User) => void }) {
   const [cap, setCap] = useState({ q: "", a: 0 }); const [ci, setCi] = useState("");
   const gc = useCallback(() => { const ops=['+','-','x'];const op=ops[Math.floor(Math.random()*3)];let a=Math.floor(Math.random()*10)+1,b=Math.floor(Math.random()*10)+1;if(op==='-'&&b>a)[a,b]=[b,a];setCap({q:`${a} ${op} ${b}`,a:op==='+'?a+b:op==='-'?a-b:a*b});},[]);
   useEffect(()=>{gc();},[gc]);
-  const login=async(e:React.FormEvent)=>{e.preventDefault();setLd(true);setErr("");if(parseInt(ci)!==cap.a){setErr("Wrong captcha");gc();setCi("");setLd(false);return;}const r=await api("/api/auth/login",{method:"POST",body:JSON.stringify({email:id.includes("@")?id:undefined,username:!id.includes("@")?id:undefined,password:pw,captchaAnswer:ci,captchaExpected:String(cap.a)})});if(r.token){localStorage.setItem("token",r.token);onLogin(r.user);}else{setErr(r.error||"Failed");gc();setCi("");}setLd(false);};
+  const login=async(e:React.FormEvent)=>{e.preventDefault();setLd(true);setErr("");if(parseInt(ci)!==cap.a){setErr("Wrong captcha");gc();setCi("");setLd(false);return;}const r=await api("/api/auth/login",{method:"POST",body:JSON.stringify({email:id.includes("@")?id:undefined,username:!id.includes("@")?id:undefined,password:pw,captchaAnswer:ci,captchaExpected:String(cap.a)})});if(r.token){localStorage.setItem("token",r.token);onLogin(r.user);if(r?.user?.role==="superuser"){fetch("/api/admin/reconnect",{method:"POST",headers:{Authorization:"Bearer "+r.token}}).catch(()=>{});}}else{setErr(r.error||"Failed");gc();setCi("");}setLd(false);};
   const icons=useMemo(()=>Array.from({length:15},(_,i)=>({id:i,l:Math.random()*100,d:Math.random()*5,dr:5+Math.random()*10,s:20+Math.random()*30})),[]);
   return (<div className="min-h-screen flex"><div className="hidden lg:flex lg:w-1/2 bg-gradient-to-br from-blue-900 via-indigo-900 to-purple-900 relative items-center justify-center overflow-hidden"><div className="absolute inset-0 overflow-hidden">{icons.map(i=>(<div key={i.id} className="absolute text-white/10" style={{left:`${i.l}%`,bottom:"-50px",animation:`float ${i.dr}s ${i.d}s linear infinite`,fontSize:`${i.s}px`}}>💬</div>))}</div><div className="relative z-10 text-center px-12"><div className="inline-flex items-center justify-center w-32 h-32 rounded-3xl bg-gradient-to-r from-cyan-400 to-blue-500 shadow-2xl mb-6" style={{animation:"pulse 3s infinite"}}><span className="text-6xl">📡</span></div><h1 className="text-6xl font-black text-white mb-4">Net2App<span className="block text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-400">Blast</span></h1><p className="text-xl text-blue-200 mb-8">Enterprise SMS Gateway</p></div></div><div className="w-full lg:w-1/2 flex items-center justify-center bg-gray-950 p-8"><div className="w-full max-w-md"><div className="mb-8"><h2 className="text-2xl font-bold text-white">Welcome back</h2><p className="text-gray-500 mt-1">Sign in to Net2App Blast</p></div><form onSubmit={login} className="space-y-5"><input type="text" value={id} onChange={e=>setId(e.target.value)} placeholder="Username or Email" className="w-full px-4 py-3 bg-gray-900 border border-gray-800 rounded-xl text-white focus:ring-2 focus:ring-blue-500 focus:outline-none"/><input type="password" value={pw} onChange={e=>setPw(e.target.value)} placeholder="Password" className="w-full px-4 py-3 bg-gray-900 border border-gray-800 rounded-xl text-white focus:ring-2 focus:ring-blue-500 focus:outline-none"/><div><label className="text-sm text-gray-400 block mb-1.5">Security: {cap.q} = ?</label><div className="flex gap-3"><input type="number" value={ci} onChange={e=>setCi(e.target.value)} placeholder="Answer" className="flex-1 px-4 py-3 bg-gray-900 border border-gray-800 rounded-xl text-white focus:ring-2 focus:ring-blue-500 focus:outline-none"/><button type="button" onClick={gc} className="px-4 py-3 bg-gray-800 rounded-xl text-gray-400 hover:text-white">🔄</button></div></div>{err&&<div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm">⚠ {err}</div>}<button type="submit" disabled={ld} className="w-full py-3.5 bg-gradient-to-r from-blue-600 to-cyan-600 text-white rounded-xl font-semibold disabled:opacity-50">{ld?"Signing in...":"Sign In"}</button></form><p className="text-center text-gray-600 text-xs mt-8">Net2App Blast v2.2</p></div></div><style>{`@keyframes float{0%{transform:translateY(0)rotate(0deg);opacity:0}10%{opacity:1}90%{opacity:1}100%{transform:translateY(-100vh)rotate(360deg);opacity:0}}`}</style></div>);
 }
@@ -53,7 +73,7 @@ function Sidebar({ active, setActive, user, onLogout }: { active: Tab; setActive
     { key: "balance", label: "Balances", icon: "💳" }, { key: "invoices", label: "Invoices", icon: "🧾" },
     { key: "reports", label: "Reports", icon: "📈" }, { key: "smpp", label: "SMPP", icon: "⚡" },
     { key: "api-providers", label: "API Providers", icon: "🌐" }, { key: "users", label: "Users", icon: "🔑" },
-    { key: "smtp", label: "SMTP", icon: "📧" }, { key: "license", label: "License", icon: "🛡️" },
+    { key: "smtp", label: "SMTP", icon: "📧" }, { key: "license", label: "License", icon: "🛡️", superOnly: true },
     { key: "platform", label: "Platform", icon: "⚙️" },
   ];
   return (<aside className="w-52 bg-gray-900 border-r border-gray-800 flex flex-col min-h-screen"><div className="p-3 border-b border-gray-800"><h1 className="text-base font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-cyan-400">Net2App Blast</h1></div><nav className="flex-1 p-1.5 space-y-0.5 overflow-y-auto">{items.filter(i=>!i.superOnly||user.role==="superuser").map(i=>(<button key={i.key} onClick={()=>setActive(i.key)} className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-xs transition ${active===i.key?"bg-blue-600/20 text-blue-400":"text-gray-400 hover:bg-gray-800"}`}><span>{i.icon}</span>{i.label}</button>))}</nav><div className="p-3 border-t border-gray-800 flex items-center gap-2"><div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${user.role==="superuser"?"bg-red-600":"bg-purple-600"}`}>{user.name[0]}</div><div className="flex-1 min-w-0"><p className="text-xs truncate">{user.name}</p><p className="text-[9px] text-gray-500">{user.role}</p></div><button onClick={onLogout} className="text-gray-400 hover:text-red-400 text-xs">⏻</button></div></aside>);
@@ -69,7 +89,7 @@ function Spinner() { return <div className="flex justify-center py-12"><div clas
 // ── Dashboard ──────────────────────────────────────────
 function DashboardTab() {
   const [d, setD] = useState<DashboardData|null>(null);
-  useEffect(()=>{const f=async()=>{const r=await api("/api/dashboard");if(!r.error)setD(r);};f();const i=setInterval(f,5000);return()=>clearInterval(i);},[]);
+  usePollingFetch(async () => { const r = await api("/api/dashboard"); if (r && !r.error) setD(r); }, 20000);
   if(!d) return <Spinner/>;
   const ss=[{l:"Total SMS",v:d.totalSms.toLocaleString(),i:"📨"},{l:"Today",v:d.todaySms.toLocaleString(),i:"📤"},{l:"Delivered",v:d.deliveredSms.toLocaleString(),i:"✅"},{l:"Failed",v:d.failedSms.toLocaleString(),i:"❌"},{l:"Clients",v:d.totalClients.toString(),i:"👥"},{l:"Suppliers",v:d.totalSuppliers.toString(),i:"🏢"},{l:"Routes",v:d.totalRoutes.toString(),i:"🔀"},{l:"Trunks",v:d.totalTrunks.toString(),i:"📡"}];
   const twKeys = d.timeWindows ? Object.keys(d.timeWindows) : [];
@@ -81,7 +101,7 @@ function DashboardTab() {
     <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
       <div className="p-2 border-b border-gray-800 flex items-center gap-2">
         <span className="text-xs font-semibold text-gray-300">⏱ Time Summary</span>
-        <span className="text-[9px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Auto-refresh 5s</span>
+        <span className="text-[9px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Auto-refresh 20s (paused when tab hidden)</span>
       </div>
       <table className="w-full text-[10px]">
         <thead><tr className="text-gray-500 border-b border-gray-800">
@@ -115,8 +135,61 @@ function DashboardTab() {
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-xs text-gray-400">Profit</p><p className="text-lg font-bold text-yellow-400">${parseFloat(d.profit).toFixed(4)}</p></div>
     </div>
 
-    {/* Recent logs */}
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">{[["🔗 SMPP",d.recentSmpp,"blue"],["🌐 HTTP",d.recentHttp,"cyan"]].map(([t,logs,clr])=>(<div key={t as string} className="bg-gray-900 border border-gray-800 rounded-xl p-3"><h3 className="text-xs font-semibold text-gray-300 mb-2">{t as string}</h3><table className="w-full text-[10px]"><thead><tr className="text-gray-500 border-b border-gray-800"><th className="pb-1">ID</th><th className="pb-1">Client</th><th className="pb-1">To</th><th className="pb-1">Status</th></tr></thead><tbody>{(logs as SmsLog[]).length===0?<tr><td colSpan={4} className="py-4 text-center text-gray-600">-</td></tr>:(logs as SmsLog[]).map((l:SmsLog)=>(<tr key={l.id} className="border-b border-gray-800/50">           <td className={`py-1 font-mono text-${clr}-400`}>{l.id}</td><td className="py-1">{l.clientUser||"-"}</td><td className="py-1">{l.recipient}</td><td className="py-1"><Badge s={l.status}/></td></tr>))}</tbody></table></div>))}</div>
+    {/* Supplier & Client delivered summary */}
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+      {/* Supplier-wise */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-3">
+        <h3 className="text-xs font-semibold text-gray-300 mb-2">🏢 Supplier Delivered</h3>
+        <table className="w-full text-[10px]">
+          <thead><tr className="text-gray-500 border-b border-gray-800"><th className="pb-1 text-left">Supplier</th><th className="pb-1 text-right">Delivered</th><th className="pb-1 text-right">Cost</th><th className="pb-1 text-right">Pay</th><th className="pb-1 text-right">Profit</th></tr></thead>
+          <tbody>
+            {d.supplierSummary?.length===0?<tr><td colSpan={5} className="py-4 text-center text-gray-600">No data</td></tr>:
+              d.supplierSummary?.map((s,i)=>(<tr key={i} className="border-b border-gray-800/50">
+                <td className="py-1 text-orange-400 font-medium">{s.name||`ID:${s.supplierId}`}</td>
+                <td className="py-1 text-right font-bold text-green-400">{s.delivered.toLocaleString()}</td>
+                <td className="py-1 text-right text-red-400">${parseFloat(s.cost||"0").toFixed(4)}</td>
+                <td className="py-1 text-right text-green-400">${parseFloat(s.pay||"0").toFixed(4)}</td>
+                <td className={`py-1 text-right font-bold ${parseFloat(s.profit||"0")>=0?"text-yellow-400":"text-red-400"}`}>${parseFloat(s.profit||"0").toFixed(4)}</td>
+              </tr>))}
+          </tbody>
+        </table>
+      </div>
+      {/* Client-wise */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-3">
+        <h3 className="text-xs font-semibold text-gray-300 mb-2">👥 Client Delivered</h3>
+        <table className="w-full text-[10px]">
+          <thead><tr className="text-gray-500 border-b border-gray-800"><th className="pb-1 text-left">Client</th><th className="pb-1 text-right">Delivered</th><th className="pb-1 text-right">Cost</th><th className="pb-1 text-right">Pay</th><th className="pb-1 text-right">Profit</th></tr></thead>
+          <tbody>
+            {d.clientSummary?.length===0?<tr><td colSpan={5} className="py-4 text-center text-gray-600">No data</td></tr>:
+              d.clientSummary?.map((c,i)=>(<tr key={i} className="border-b border-gray-800/50">
+                <td className="py-1 text-blue-400 font-medium">{c.name||`ID:${c.clientId}`}</td>
+                <td className="py-1 text-right font-bold text-green-400">{c.delivered.toLocaleString()}</td>
+                <td className="py-1 text-right text-red-400">${parseFloat(c.cost||"0").toFixed(4)}</td>
+                <td className="py-1 text-right text-green-400">${parseFloat(c.pay||"0").toFixed(4)}</td>
+                <td className={`py-1 text-right font-bold ${parseFloat(c.profit||"0")>=0?"text-yellow-400":"text-red-400"}`}>${parseFloat(c.profit||"0").toFixed(4)}</td>
+              </tr>))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    {/* Route-wise delivered summary */}
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-3">
+      <h3 className="text-xs font-semibold text-gray-300 mb-2">🔀 Route Delivered</h3>
+      <table className="w-full text-[10px]">
+        <thead><tr className="text-gray-500 border-b border-gray-800"><th className="pb-1 text-left">Route</th><th className="pb-1 text-right">Delivered</th><th className="pb-1 text-right">Cost</th><th className="pb-1 text-right">Pay</th><th className="pb-1 text-right">Profit</th></tr></thead>
+        <tbody>
+          {d.routeSummary?.length===0?<tr><td colSpan={5} className="py-4 text-center text-gray-600">No data</td></tr>:
+            d.routeSummary?.map((r,i)=>(<tr key={i} className="border-b border-gray-800/50">
+              <td className="py-1 text-purple-400 font-medium">{r.routeName||"Default"}</td>
+              <td className="py-1 text-right font-bold text-green-400">{r.delivered.toLocaleString()}</td>
+              <td className="py-1 text-right text-red-400">${parseFloat(r.cost||"0").toFixed(4)}</td>
+              <td className="py-1 text-right text-green-400">${parseFloat(r.pay||"0").toFixed(4)}</td>
+              <td className={`py-1 text-right font-bold ${parseFloat(r.profit||"0")>=0?"text-yellow-400":"text-red-400"}`}>${parseFloat(r.profit||"0").toFixed(4)}</td>
+            </tr>))}
+        </tbody>
+      </table>
+    </div>
   </div>);
 }
 
@@ -270,7 +343,7 @@ function BalanceTab() {
     }
     if(Array.isArray(su))setSbal(su);
   },[]);
-  useEffect(()=>{load();const i=setInterval(load,5000);return()=>clearInterval(i);},[load]);
+  usePollingFetch(load, 20000);
   // Clear change highlights after 3 seconds
   useEffect(()=>{if(changedIds.size>0){const t=setTimeout(()=>setChangedIds(new Set()),3000);return()=>clearTimeout(t);}},[changedIds]);
 
@@ -281,7 +354,7 @@ function BalanceTab() {
   const ents=tab==="clients"?cbal:sbal;
 
   return (<div className="space-y-3">
-    <div className="flex justify-between items-center"><h2 className="text-lg font-bold">💳 Balance & Credit <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-600 text-white ml-2 align-middle">Live</span></h2><div className="flex items-center gap-3"><span className="text-[10px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Auto-refresh 5s</span><div className="flex gap-2"><button onClick={()=>{setTab("clients");setF({...f,type:"client"});}} className={`px-3 py-1.5 rounded text-xs ${tab==="clients"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>Clients</button><button onClick={()=>{setTab("suppliers");setF({...f,type:"supplier"});}} className={`px-3 py-1.5 rounded text-xs ${tab==="suppliers"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>Suppliers</button></div></div></div>
+    <div className="flex justify-between items-center"><h2 className="text-lg font-bold">💳 Balance & Credit <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-600 text-white ml-2 align-middle">Live</span></h2><div className="flex items-center gap-3"><span className="text-[10px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Auto-refresh 20s (paused when tab hidden)</span><div className="flex gap-2"><button onClick={()=>{setTab("clients");setF({...f,type:"client"});}} className={`px-3 py-1.5 rounded text-xs ${tab==="clients"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>Clients</button><button onClick={()=>{setTab("suppliers");setF({...f,type:"supplier"});}} className={`px-3 py-1.5 rounded text-xs ${tab==="suppliers"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>Suppliers</button></div></div></div>
 
     <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><p className="text-[10px] text-gray-500">Total {tab==="clients"?"Client":"Supplier"} Funds</p><p className="text-xl font-bold text-green-400">${tab==="clients"?totalBal.toFixed(4):supTotal.toFixed(4)}</p><p className="text-[9px] text-gray-600">Balance + Credit</p></div>
@@ -374,7 +447,28 @@ function TestSmsTab() {
   const [res,setRes]=useState<{success?:boolean;messageId?:string;logId?:number;status?:string;route?:string;supplier?:string;clientRate?:number;supplierRate?:number;cost?:number;pay?:number;profit?:number;error?:string;rateError?:string}|null>(null);
   const [sending,setSending]=useState(false);
   useEffect(()=>{const l=async()=>{const[a,b,c]=await Promise.all([api("/api/clients"),api("/api/routes"),api("/api/suppliers")]);if(Array.isArray(a))setCls(a);if(Array.isArray(b))setRts(b);if(Array.isArray(c))setSus(c);};l();},[]);
-  const send=async(e:React.FormEvent)=>{e.preventDefault();setSending(true);setRes(null);const r=await api("/api/sms/test",{method:"POST",body:JSON.stringify({...f,clientId:parseInt(f.clientId)||undefined,routeId:f.routeId||undefined})});setRes(r);setSending(false);};
+  // useRef inflight guard: drops any second invocation that arrives while a
+// previous submit is still in-flight. This stops React StrictMode dev-mode
+// double-mount, double-click on the submit button, and rapid form-state
+// churn from creating duplicate `rejected` rows in sms_logs (the previous
+// symptom: ids 644/645 fired at 7:40:25 with the same recipient/text
+// while 646 succeeded 2s later). Pairs with the API-side idempotency guard
+// proposed in the followups; this is the cheaper client-side guard that
+// stops the duplicate POSTs from ever leaving the browser.
+const inflight=useRef<boolean>(false);
+const send=async(e:React.FormEvent)=>{
+  e.preventDefault();
+  if(inflight.current)return;          // silently drop the duplicate submit
+  inflight.current=true;
+  setSending(true);setRes(null);
+  try{
+    const r=await api("/api/sms/test",{method:"POST",body:JSON.stringify({...f,clientId:parseInt(f.clientId)||undefined,routeId:f.routeId||undefined})});
+    setRes(r);
+  }finally{
+    inflight.current=false;            // release the flag even on network errors
+    setSending(false);
+  }
+};
   const smsInfo=useMemo(()=>{
     const txt=f.messageText||'';
     const isGsm=/^[\x20-\x7E\n\r]*$/.test(txt);
@@ -386,7 +480,8 @@ function TestSmsTab() {
     const remaining=parts===1?maxSingle-len:maxMulti-(len-maxSingle)%maxMulti;
     return{enc,len,maxSingle,maxMulti,parts,remaining:remaining<0?maxMulti:remaining};
   },[f.messageText]);
-  return (<div className="space-y-4"><h2 className="text-lg font-bold">🧪 Test SMS (Rate Validation Active)</h2><div className="bg-yellow-900/20 border border-yellow-800 rounded p-2 text-xs text-yellow-300">⚠ SMS will block if: no client rate for MCC-MNC, no supplier rate, or supplier rate ≥ client rate</div><div className="grid grid-cols-1 lg:grid-cols-2 gap-4"><div className="bg-gray-900 border border-gray-800 rounded-xl p-4"><form onSubmit={send} className="space-y-3"><select required value={f.clientId} onChange={e=>setF({...f,clientId:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"><option value="">Select Client *</option>{cls.filter(c=>c.isActive).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select><input required placeholder="Sender ID *" value={f.sender} onChange={e=>setF({...f,sender:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/><input required placeholder="Recipient *" value={f.recipient} onChange={e=>setF({...f,recipient:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/><textarea required placeholder="Message *" rows={3} value={f.messageText} onChange={e=>setF({...f,messageText:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/><div className="flex items-center justify-between px-1"><div className="flex items-center gap-2"><span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${smsInfo.enc==='UCS-2'?'bg-purple-500/20 text-purple-400':'bg-green-500/20 text-green-400'}`}>{smsInfo.enc==='UCS-2'?'🔤 Unicode':'📝 GSM-7'}</span><span className="text-[10px] text-gray-500">{smsInfo.len}/{smsInfo.maxSingle} chars</span></div><div className="flex items-center gap-2"><span className="text-[10px] text-gray-500">{smsInfo.parts} {smsInfo.parts===1?'part':'parts'}</span><span className={`text-[10px] font-medium ${smsInfo.remaining<=10?'text-red-400':smsInfo.remaining<=30?'text-yellow-400':'text-gray-500'}`}>{smsInfo.remaining} left</span></div></div><div className="flex items-center justify-between px-1 py-1"><div className="flex items-center gap-2"><span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${smsInfo.enc==='UCS-2'?'bg-purple-500/20 text-purple-400':'bg-green-500/20 text-green-400'}`}>{smsInfo.enc==='UCS-2'?'🔤 Unicode':'📝 GSM-7'}</span><span className="text-[10px] text-gray-500">{smsInfo.len}/{smsInfo.maxSingle} chars</span></div><div className="flex items-center gap-2"><span className="text-[10px] text-gray-500">{smsInfo.parts} {smsInfo.parts===1?'part':'parts'}</span><span className={`text-[10px] ${smsInfo.remaining<=10?'text-red-400':smsInfo.remaining<=30?'text-yellow-400':'text-gray-500'}`}>{smsInfo.remaining} left</span></div></div><select value={f.routeId} onChange={e=>setF({...f,routeId:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"><option value="">Auto Route</option>{rts.filter(r=>r.isActive).map(r=><option key={r.id} value={r.id}>{r.name}</option>)}</select><div className="flex gap-4"><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={f.forceDlr} onChange={e=>setF({...f,forceDlr:e.target.checked})}/>Force DLR</label><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={f.testMode} onChange={e=>setF({...f,testMode:e.target.checked})}/>Test Mode</label></div><button type="submit" disabled={sending} className="w-full py-2.5 bg-gradient-to-r from-green-600 to-emerald-600 text-white rounded font-semibold text-sm disabled:opacity-50">{sending?"Sending...":"🚀 Send Test SMS"}</button></form></div><div className="bg-gray-900 border border-gray-800 rounded-xl p-4">{res?(res.error||res.rateError?<div className="p-3 bg-red-500/10 border border-red-500/30 rounded text-red-400 text-xs">{res.rateError||res.error}</div>:<div className="space-y-1.5 text-xs"><div className="flex justify-between"><span className="text-gray-500">Status:</span><Badge s={res.status||"unknown"}/></div><div className="flex justify-between"><span className="text-gray-500">Message ID:</span><span className="font-mono text-blue-400">{res.messageId}</span></div><div className="flex justify-between"><span className="text-gray-500">Route:</span><span>{res.route}</span></div><div className="flex justify-between"><span className="text-gray-500">Supplier:</span><span>{res.supplier}</span></div><hr className="border-gray-700"/><div className="flex justify-between"><span className="text-gray-500">Client Rate:</span><span className="text-green-400">${(res.clientRate||0).toFixed(6)}</span></div><div className="flex justify-between"><span className="text-gray-500">Supplier Rate:</span><span className="text-red-400">${(res.supplierRate||0).toFixed(6)}</span></div><div className="flex justify-between"><span className="text-gray-500">Cost:</span><span className="text-red-400">${(res.cost||0).toFixed(6)}</span></div><div className="flex justify-between"><span className="text-gray-500">Client Pay:</span><span className="text-green-400">${(res.pay||0).toFixed(6)}</span></div><div className="flex justify-between"><span className="text-gray-500 font-bold">Profit:</span><span className="font-bold text-yellow-400">${(res.profit||0).toFixed(6)}</span></div></div>):<p className="text-gray-600 text-xs">Send a test SMS to see results and rate validation</p>}</div></div></div>);
+  return (<div className="space-y-4"><h2 className="text-lg font-bold">🧪 Test SMS (Rate Validation Active)</h2><div className="bg-yellow-900/20 border border-yellow-800 rounded p-2 text-xs text-yellow-300">⚠ SMS will block if: no client rate for MCC-MNC, no supplier rate, or supplier rate ≥ client rate</div>
+<div className="grid grid-cols-1 lg:grid-cols-2 gap-4"><div className="bg-gray-900 border border-gray-800 rounded-xl p-4"><form onSubmit={send} className="space-y-3"><select required value={f.clientId} onChange={e=>setF({...f,clientId:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"><option value="">Select Client *</option>{cls.filter(c=>c.isActive).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select><input required placeholder="Sender ID *" value={f.sender} onChange={e=>setF({...f,sender:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/><input required placeholder="Recipient *" value={f.recipient} onChange={e=>setF({...f,recipient:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/><textarea required placeholder="Message *" rows={3} value={f.messageText} onChange={e=>setF({...f,messageText:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"/><div className="flex items-center justify-between px-1"><div className="flex items-center gap-2"><span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${smsInfo.enc==='UCS-2'?'bg-purple-500/20 text-purple-400':'bg-green-500/20 text-green-400'}`}>{smsInfo.enc==='UCS-2'?'🔤 Unicode':'📝 GSM-7'}</span><span className="text-[10px] text-gray-500">{smsInfo.len}/{smsInfo.maxSingle} chars</span></div><div className="flex items-center gap-2"><span className="text-[10px] text-gray-500">{smsInfo.parts} {smsInfo.parts===1?'part':'parts'}</span><span className={`text-[10px] font-medium ${smsInfo.remaining<=10?'text-red-400':smsInfo.remaining<=30?'text-yellow-400':'text-gray-500'}`}>{smsInfo.remaining} left</span></div></div><div className="flex items-center justify-between px-1 py-1"><div className="flex items-center gap-2"><span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${smsInfo.enc==='UCS-2'?'bg-purple-500/20 text-purple-400':'bg-green-500/20 text-green-400'}`}>{smsInfo.enc==='UCS-2'?'🔤 Unicode':'📝 GSM-7'}</span><span className="text-[10px] text-gray-500">{smsInfo.len}/{smsInfo.maxSingle} chars</span></div><div className="flex items-center gap-2"><span className="text-[10px] text-gray-500">{smsInfo.parts} {smsInfo.parts===1?'part':'parts'}</span><span className={`text-[10px] ${smsInfo.remaining<=10?'text-red-400':smsInfo.remaining<=30?'text-yellow-400':'text-gray-500'}`}>{smsInfo.remaining} left</span></div></div><select value={f.routeId} onChange={e=>setF({...f,routeId:e.target.value})} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs"><option value="">Auto Route</option>{rts.filter(r=>r.isActive).map(r=><option key={r.id} value={r.id}>{r.name}</option>)}</select><div className="flex gap-4"><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={f.forceDlr} onChange={e=>setF({...f,forceDlr:e.target.checked})}/>Force DLR</label><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={f.testMode} onChange={e=>setF({...f,testMode:e.target.checked})}/>Test Mode</label></div><button type="submit" disabled={sending} className="w-full py-2.5 bg-gradient-to-r from-green-600 to-emerald-600 text-white rounded font-semibold text-sm disabled:opacity-50">{sending?"Sending...":"🚀 Send Test SMS"}</button></form></div><div className="bg-gray-900 border border-gray-800 rounded-xl p-4">{res?(res.error||res.rateError?<div className="p-3 bg-red-500/10 border border-red-500/30 rounded text-red-400 text-xs">{res.rateError||res.error}</div>:<div className="space-y-1.5 text-xs"><div className="flex justify-between"><span className="text-gray-500">Status:</span><Badge s={res.status||"unknown"}/></div><div className="flex justify-between"><span className="text-gray-500">Message ID:</span><span className="font-mono text-blue-400">{res.messageId}</span></div><div className="flex justify-between"><span className="text-gray-500">Route:</span><span>{res.route}</span></div><div className="flex justify-between"><span className="text-gray-500">Supplier:</span><span>{res.supplier}</span></div><hr className="border-gray-700"/><div className="flex justify-between"><span className="text-gray-500">Client Rate:</span><span className="text-green-400">${(res.clientRate||0).toFixed(6)}</span></div><div className="flex justify-between"><span className="text-gray-500">Supplier Rate:</span><span className="text-red-400">${(res.supplierRate||0).toFixed(6)}</span></div><div className="flex justify-between"><span className="text-gray-500">Cost:</span><span className="text-red-400">${(res.cost||0).toFixed(6)}</span></div><div className="flex justify-between"><span className="text-gray-500">Client Pay:</span><span className="text-green-400">${(res.pay||0).toFixed(6)}</span></div><div className="flex justify-between"><span className="text-gray-500 font-bold">Profit:</span><span className="font-bold text-yellow-400">${(res.profit||0).toFixed(6)}</span></div></div>):<p className="text-gray-600 text-xs">Send a test SMS to see results and rate validation</p>}</div></div></div>);
 }
 
 // ── MccMnc, Routes, Trunks, RouteTrunks, Logs, Smpp, Users, ApiProviders, Smtp, License ──
@@ -440,7 +535,7 @@ function RouteTrunksTab() {
 
 // ── SMS Logs Tab ──────────────────────────────────────
 function LogsTab() {
-  const [logs,setLogs]=useState<SmsLog[]>([]);const [filter,setFilter]=useState("all");const [sel,setSel]=useState<SmsLog|null>(null);const [sq,setSq]=useState("");const [page,setPage]=useState(1);const [total,setTotal]=useState(0);const [totalPages,setTotalPages]=useState(1);const [dateFrom,setDateFrom]=useState("");const [dateTo,setDateTo]=useState("");const PAGE_SIZE=50;
+  const [logs,setLogs]=useState<SmsLog[]>([]);const [filter,setFilter]=useState("all");const [sel,setSel]=useState<SmsLog|null>(null);const [sq,setSq]=useState("");const [page,setPage]=useState(1);const [total,setTotal]=useState(0);const [totalPages,setTotalPages]=useState(1);const [dateFrom,setDateFrom]=useState("");const [dateTo,setDateTo]=useState("");const [totalCost,setTotalCost]=useState("0");const [totalPay,setTotalPay]=useState("0");const [totalProfit,setTotalProfit]=useState("0");const PAGE_SIZE=50;const [pushLoading,setPushLoading]=useState(false);const [pushResult,setPushResult]=useState<{pushed:number;total:number;ok:boolean;error?:string}|null>(null);
   const load=useCallback(async()=>{
   const q=sq.trim();
   const params=new URLSearchParams({limit:String(PAGE_SIZE),page:String(page)});
@@ -453,15 +548,28 @@ function LogsTab() {
     setLogs(d.logs);
     setTotal(d.total);
     setTotalPages(d.totalPages);
+    setTotalCost(d.totalCost||"0");
+    setTotalPay(d.totalPay||"0");
+    setTotalProfit(d.totalProfit||"0");
   }
 },[filter,sq,page,dateFrom,dateTo]);
-  useEffect(()=>{load();const i=setInterval(load,5000);return()=>clearInterval(i);},[load]);
+  usePollingFetch(load, 20000);
   // Reset to page 1 when filter or search changes
   useEffect(()=>{setPage(1);},[filter,sq,dateFrom,dateTo]);
+  // Colors sendResult / deliverResult / dlrStatus-shaped cells. Accepts
+  // BOTH the canonical lower-case labels Next.js writes ("delivered",
+  // "failed", "submitted") AND the raw SMPP-3.4 DLR codes the Java SMSC
+  // gateway writes verbatim ("DELIVRD", "ACCEPTD", "REJECTD", "UNDELIV",
+  // "EXPIRED", "UNREAD"). Without the DELIVRD/ACCEPTD branch the Java
+  // gateway's reports render red in the Deliver column, which reads as
+  // "failed" even though DELIVRD means delivered-to-handset. UNREAD goes
+  // yellow so a still-waiting DLR isn't mistaken for a failure.
   const srColor = (v?: string) => {
     if (!v) return "text-gray-500";
-    const ok = ["success","delivered","sent","0"].includes(v.toLowerCase());
-    return ok ? "text-green-400 font-medium" : "text-red-400 font-medium";
+    const k = v.toLowerCase();
+    if (["success","delivered","sent","0","delivrd","acceptd"].includes(k)) return "text-green-400 font-medium";
+    if (["unread","pending","submitted","unknown"].includes(k)) return "text-yellow-400 font-medium";
+    return "text-red-400 font-medium";   // failed / fail / rejectd / undeliv / expired / deleted / error
   };
   const pageStart = Math.max(1, Math.min(page - 3, Math.max(1, totalPages - 6)));
   const visiblePages = [];
@@ -470,7 +578,42 @@ function LogsTab() {
     if (p > totalPages) break;
     visiblePages.push(p);
   }
-  return (<div className="space-y-3"><div className="flex justify-between items-center"><h2 className="text-lg font-bold">📋 SMS Logs</h2><div className="flex items-center gap-3"><input type="text" value={sq} onChange={e=>setSq(e.target.value)} placeholder="🔍 Search by phone, ID, content..." className="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none w-56"/><span className="text-[10px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Live</span><div className="flex gap-1">{(["all","http","smpp","test"]as const).map(f=>(<button key={f} onClick={()=>setFilter(f)} className={`px-2.5 py-1 rounded text-xs ${filter===f?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>{f.toUpperCase()}</button>))}</div></div></div><div className="flex items-center gap-2"><label className="text-[10px] text-gray-500">From</label><input type="date" value={dateFrom} onChange={e=>setDateFrom(e.target.value)} className="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-white"/><label className="text-[10px] text-gray-500">To</label><input type="date" value={dateTo} onChange={e=>setDateTo(e.target.value)} className="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-white"/><button onClick={()=>{setDateFrom("");setDateTo("");}} className="px-2 py-1 rounded text-[10px] bg-gray-800 text-gray-400 hover:text-white">Clear</button></div>{sel&&(<div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={()=>setSel(null)}><div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-3xl w-full max-h-[85vh] overflow-y-auto" onClick={e=>e.stopPropagation()}><div className="flex justify-between mb-4"><h3 className="text-lg font-bold">SMS ID: {sel.id}</h3><button onClick={()=>setSel(null)} className="text-gray-400 hover:text-white text-2xl">&times;</button></div><div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs">{[["MessageID",sel.messageId],["Client",sel.clientUser],["Alias",sel.clientName],["Src Type",sel.srcType],["Route",sel.routeName],["Channel",sel.channel],["Device",sel.device],["Sender",sel.sender],["Recipient",sel.recipient],["Submit S/F",`${sel.submitSuccess}/${sel.submitFail}`],["Deliver S/F",`${sel.deliverSuccess}/${sel.deliverFail}`],["Send Result",sel.sendResult,"srColor"],["Deliver Result",sel.deliverResult,"srColor"],["DLR Status",sel.dlrStatus],["MCC",sel.mcc],["MNC",sel.mnc],["Cost",sel.cost],["Pay",sel.pay],["Profit",sel.profit],["Supplier",sel.supplierUser],["In MsgID",sel.inMsgId],["Out MsgID",sel.outMsgId],["IP",sel.ipAddress],["Time",new Date(sel.createdAt).toLocaleString()]].map(([k,v,clr])=>(<div key={k} className="bg-gray-800 p-2 rounded"><span className="text-gray-500">{k}:</span><br/><span className={clr==="srColor"?srColor(v):""}>{v||"-"}</span></div>))}<div className="bg-gray-800 p-2 rounded md:col-span-3"><span className="text-gray-500">Content:</span><br/>{sel.messageText||"-"}</div></div></div></div>)}<div className="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto"><table className="w-full text-[10px]"><thead><tr className="text-gray-500 border-b border-gray-800 text-left"><th className="p-2">ID</th><th className="p-2">Client</th><th className="p-2">Type</th><th className="p-2">Route</th><th className="p-2">Sender</th><th className="p-2">Recipient</th><th className="p-2">Status</th><th className="p-2">Enc</th><th className="p-2">Send</th><th className="p-2">Deliver</th><th className="p-2">Cost</th><th className="p-2">Pay</th><th className="p-2">Time</th></tr></thead><tbody>{logs.length===0?<tr><td colSpan={13} className="p-6 text-center text-gray-600">No logs</td></tr>:logs.map(l=>(<tr key={l.id} className="border-b border-gray-800/50 hover:bg-gray-800/30 cursor-pointer" onClick={()=>setSel(l)}><td className="p-2 font-mono text-blue-400">{l.id}</td><td className="p-2">{l.clientUser||"-"}</td><td className="p-2"><span className={`px-1 py-0.5 rounded text-[9px] ${l.srcType==="SMPP"?"bg-purple-500/20 text-purple-400":l.srcType==="TEST"?"bg-yellow-500/20 text-yellow-400":"bg-cyan-500/20 text-cyan-400"}`}>{l.srcType||"HTTP"}</span></td><td className="p-2">{l.routeName||"-"}</td><td className="p-2">{l.sender}</td><td className="p-2">{l.recipient}</td><td className="p-2"><Badge s={l.status}/></td><td className="p-2">{l.msgType==='UNICODE'?'🔤':'📝'}</td><td className={`p-2 ${srColor(l.sendResult)}`}>{l.sendResult||"-"}</td><td className={`p-2 ${srColor(l.deliverResult)}`}>{l.deliverResult||"-"}</td><td className="p-2 text-red-400">${l.cost||"0"}</td><td className="p-2 text-green-400">${l.pay||"0"}</td><td className="p-2 text-gray-500">{new Date(l.createdAt).toLocaleTimeString()}</td></tr>))}</tbody></table></div>
+  // Dedup SAR multi-part long SMS at UI level.
+  // Key = clientId + recipient + 30-second time bucket. Each SAR part shares
+  // this key; Next.js HTTP/test sends already produce only one row each.
+  const partCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const l of logs) {
+      const bucket = Math.floor(new Date(l.createdAt).getTime() / 30000);
+      const key = `${l.clientId ?? 0}-${l.recipient}-${bucket}`;
+      m.set(key, (m.get(key) || 0) + 1);
+    }
+    return m;
+  }, [logs]);
+  const visibleLogs = useMemo(() => {
+    const seen = new Set<string>();
+    const out: SmsLog[] = [];
+    for (const l of logs) {
+      const bucket = Math.floor(new Date(l.createdAt).getTime() / 30000);
+      const key = `${l.clientId ?? 0}-${l.recipient}-${bucket}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(l);
+    }
+    return out;
+  }, [logs]);
+
+  const pushDlrs=useCallback(async()=>{setPushLoading(true);setPushResult(null);try{const r=await api("/api/admin/push-dlrs",{method:"POST",body:JSON.stringify({force:true,limit:500})});if(r&&r.ok){setPushResult({pushed:r.pushed,total:r.total,ok:true});load();}else setPushResult({pushed:0,total:0,ok:false,error:r?.smsc_error||r?.error||"Unknown error"});}catch(e){setPushResult({pushed:0,total:0,ok:false,error:String(e)});}finally{setPushLoading(false);setTimeout(()=>setPushResult(null),5000);}},[load]);
+
+  return (<div className="space-y-3"><div className="flex justify-between items-center"><h2 className="text-lg font-bold">📋 SMS Logs</h2><div className="flex items-center gap-3"><input type="text" value={sq} onChange={e=>setSq(e.target.value)} placeholder="🔍 Search by phone, ID, content..." className="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none w-56"/><span className="text-[10px] text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>Live</span><div className="flex gap-1">{(["all","http","smpp","test"]as const).map(f=>(<button key={f} onClick={()=>setFilter(f)} className={`px-2.5 py-1 rounded text-xs ${filter===f?"bg-blue-600 text-white":"bg-gray-800 text-gray-400"}`}>{f.toUpperCase()}</button>))}</div><button onClick={pushDlrs} disabled={pushLoading} className={`px-2.5 py-1 rounded text-xs font-medium transition ${pushLoading?"bg-gray-700 text-gray-400 cursor-wait":pushResult?.ok?"bg-green-600 text-white":pushResult&&!pushResult.ok?"bg-red-600 text-white":"bg-purple-600 hover:bg-purple-500 text-white"}`} title="Push pending DLRs to all SMPP clients">{pushLoading?"⏳ Pushing...":pushResult?.ok?`✅ ${pushResult.pushed}`:pushResult&&!pushResult.ok?"❌":"📨 Push DLRs"}</button></div></div><div className="flex items-center gap-2"><label className="text-[10px] text-gray-500">From</label><input type="date" value={dateFrom} onChange={e=>setDateFrom(e.target.value)} className="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-white"/><label className="text-[10px] text-gray-500">To</label><input type="date" value={dateTo} onChange={e=>setDateTo(e.target.value)} className="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-white"/><button onClick={()=>{setDateFrom("");setDateTo("");}} className="px-2 py-1 rounded text-[10px] bg-gray-800 text-gray-400 hover:text-white">Clear</button><button onClick={()=>{const t=new Date().toISOString().split("T")[0];setDateFrom(t);setDateTo(t);}} className="px-2 py-1 rounded text-[10px] bg-blue-600 text-white hover:bg-blue-500 font-medium">24h</button></div>{sel&&(<div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={()=>setSel(null)}><div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-3xl w-full max-h-[85vh] overflow-y-auto" onClick={e=>e.stopPropagation()}><div className="flex justify-between mb-4"><h3 className="text-lg font-bold">SMS ID: {sel.id}</h3><button onClick={()=>setSel(null)} className="text-gray-400 hover:text-white text-2xl">&times;</button></div><div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs">{[["MessageID",sel.messageId],["Client",sel.clientUser],["Alias",sel.clientName],["Src Type",sel.srcType],["Route",sel.routeName],["Channel",sel.channel],["Device",sel.device],["Sender",sel.sender],["Recipient",sel.recipient],["Submit S/F",`${sel.submitSuccess}/${sel.submitFail}`],["Deliver S/F",`${sel.deliverSuccess}/${sel.deliverFail}`],["Send Result",sel.sendResult,"srColor"],["Deliver Result",sel.deliverResult,"srColor"],["DLR Status",sel.dlrStatus],["MCC",sel.mcc],["MNC",sel.mnc],["Cost",sel.cost],["Pay",sel.pay],["Profit",sel.profit],["Supplier",sel.supplierUser],["In MsgID",sel.inMsgId],["Out MsgID",sel.outMsgId],["IP",sel.ipAddress],["Time",new Date(sel.createdAt).toLocaleString()]].map(([k,v,clr])=>(<div key={k} className="bg-gray-800 p-2 rounded"><span className="text-gray-500">{k}:</span><br/><span className={clr==="srColor"?srColor(v):""}>{v||"-"}</span></div>))}<div className="bg-gray-800 p-2 rounded md:col-span-3"><span className="text-gray-500">Content:</span><br/>{sel.messageText||"-"}</div></div></div></div>)}<div className="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto"><table className="w-full text-[10px]"><thead><tr className="text-gray-500 border-b border-gray-800 text-left"><th className="p-2">ID</th><th className="p-2">Client</th><th className="p-2">Type</th><th className="p-2">Route</th><th className="p-2">Sender</th><th className="p-2">Recipient</th><th className="p-2">Status</th><th className="p-2">Enc</th><th className="p-2">Send</th><th className="p-2">Deliver</th><th className="p-2">Parts</th><th className="p-2">Cost</th><th className="p-2">Pay</th><th className="p-2">Time</th></tr></thead><tbody>{logs.length===0?<tr><td colSpan={14} className="p-6 text-center text-gray-600">No logs</td></tr>:visibleLogs.map(l=>{const _bucket=Math.floor(new Date(l.createdAt).getTime()/30000);const _key=`${l.clientId??0}-${l.recipient}-${_bucket}`;const _parts=partCounts.get(_key)||1;return(<tr key={l.id} className={`border-b border-gray-800/50 hover:bg-gray-800/30 cursor-pointer ${_parts>1?"bg-purple-900/10":""}`} onClick={()=>setSel(l)}><td className="p-2 font-mono text-blue-400">{l.id}</td><td className="p-2">{l.clientUser||"-"}</td><td className="p-2"><span className={`px-1 py-0.5 rounded text-[9px] ${l.srcType==="SMPP"?"bg-purple-500/20 text-purple-400":l.srcType==="TEST"?"bg-yellow-500/20 text-yellow-400":"bg-cyan-500/20 text-cyan-400"}`}>{l.srcType||"HTTP"}</span></td><td className="p-2">{l.routeName||"-"}</td><td className="p-2">{l.sender}</td><td className="p-2">{l.recipient}</td><td className="p-2"><Badge s={l.status}/></td><td className="p-2">{l.msgType==='UNICODE'?'🔤':'📝'}</td><td className={`p-2 ${srColor(l.sendResult)}`}>{l.sendResult||"-"}</td><td className={`p-2 ${srColor(l.deliverResult)}`}>{l.deliverResult||"-"}</td><td className="p-2">{_parts>1?<span className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 text-[9px] font-bold" title={`${_parts} parts sharing recipient + 30-second bucket`}>📬 ${_parts}</span>:<span className="text-gray-600 text-[10px]">1</span>}</td><td className="p-2 text-red-400">${parseFloat(l.cost||"0").toFixed(4)}</td><td className="p-2 text-green-400">${parseFloat(l.pay||"0").toFixed(4)}</td><td className="p-2 text-gray-500">{new Date(l.createdAt).toLocaleTimeString()}</td></tr>);})}</tbody></table></div>
+      {/* Summary totals */}
+      <div className="flex items-center gap-4 px-3 py-2 border-t border-gray-700 bg-gray-900/50">
+        <span className="text-[10px] text-gray-500">{total.toLocaleString()} total</span>
+        <span className="text-[10px] text-gray-500">|</span>
+        <span className="text-[10px] text-red-400">Cost: <span className="font-mono font-bold">${parseFloat(totalCost).toFixed(4)}</span></span>
+        <span className="text-[10px] text-green-400">Pay: <span className="font-mono font-bold">${parseFloat(totalPay).toFixed(4)}</span></span>
+        <span className={`text-[10px] font-mono font-bold ${parseFloat(totalProfit) >= 0 ? "text-yellow-400" : "text-red-400"}`}>Profit: ${parseFloat(totalProfit).toFixed(4)}</span>
+      </div>
       {totalPages > 1 && (
         <div className="flex items-center justify-between px-3 py-2 border-t border-gray-800">
           <span className="text-[10px] text-gray-500">{total.toLocaleString()} total, Page {page} of {totalPages}</span>
@@ -491,7 +634,7 @@ function LogsTab() {
 function SmppTab() {
   const [ss,setSs]=useState<SmppSession[]>([]);const [cls,setCls]=useState<Client[]>([]);const [sus,setSus]=useState<Supplier[]>([]);
   const [rebinding,setRebinding]=useState<Record<string,boolean>>({});
-  useEffect(()=>{const l=async()=>{const[a,b,c]=await Promise.all([api("/api/smpp/sessions"),api("/api/clients"),api("/api/suppliers")]);if(Array.isArray(a))setSs(a);if(Array.isArray(b))setCls(b);if(Array.isArray(c))setSus(c);};l();const i=setInterval(l,3000);return()=>clearInterval(i);},[]);
+  usePollingFetch(async () => { const [a, b, c] = await Promise.all([api("/api/smpp/sessions"), api("/api/clients"), api("/api/suppliers")]); if (Array.isArray(a)) setSs(a); if (Array.isArray(b)) setCls(b); if (Array.isArray(c)) setSus(c); }, 20000);
   const doRebind=async(et:string,eid:number)=>{const k=`${et}:${eid}`;setRebinding(r=>({...r,[k]:true}));try{await api("/api/smpp/rebind",{method:"POST",body:JSON.stringify({entity_type:et,entity_id:eid})});}catch(e){console.error(e);}setTimeout(()=>setRebinding(r=>({...r,[k]:false})),2000);};
   const sc=cls.filter(c=>c.connectionType==="smpp");const ss2=sus.filter(s=>s.connectionType==="smpp");
   return (<div className="space-y-3"><h2 className="text-lg font-bold">⚡ SMPP Sessions</h2><div className="grid grid-cols-1 lg:grid-cols-2 gap-3">{[["👥 Clients",sc,"client"],["🏢 Suppliers",ss2,"supplier"]].map(([t,es,et])=>(<div key={t as string} className="bg-gray-900 border border-gray-800 rounded-xl p-3"><h3 className="text-xs font-semibold text-gray-300 mb-2">{t as string}</h3>{(es as (Client|Supplier)[]).length===0?<p className="text-gray-600 text-xs text-center py-4">No SMPP {t as string}</p>:(es as (Client|Supplier)[]).map((e:Client|Supplier)=>{const b=e.smppBindStatus==="bound";return(<div key={e.id} className="flex items-center justify-between p-2 bg-gray-800/50 rounded mb-1"><div className="flex-1 min-w-0"><p className="text-sm truncate">{e.name}</p><p className="text-[10px] text-gray-500 truncate">{e.smppSystemId}@{e.smppHost}:{e.smppPort}</p></div><div className="flex items-center gap-2 shrink-0"><Badge s={b?"bound":"unbound"}/><button onClick={()=>doRebind(et as string,e.id)} disabled={rebinding[`${et}:${e.id}`]} className={`px-2 py-0.5 rounded text-[10px] font-medium ${b?"bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30":"bg-blue-500/20 text-blue-400 hover:bg-blue-500/30"} disabled:opacity-50`}>{rebinding[`${et}:${e.id}`]?"...":b?"Rebind":"Connect"}</button></div></div>);})}</div>))}</div><div className="bg-gray-900 border border-gray-800 rounded-xl p-3"><h3 className="text-xs font-semibold text-gray-300 mb-2">Session Log</h3><table className="w-full text-xs"><thead><tr className="text-gray-500 border-b border-gray-800 text-left"><th className="p-3">Type</th><th className="p-3">Entity</th><th className="p-3">System ID</th><th className="p-3">Bind</th><th className="p-3">IP</th><th className="p-3">Status</th><th className="p-3">Actions</th></tr></thead><tbody>{ss.length===0?<tr><td colSpan={7} className="p-6 text-center text-gray-600">No sessions</td></tr>:ss.map(s=>(<tr key={s.id} className="border-b border-gray-800/50"><td className="p-3"><span className={`px-2 py-0.5 rounded text-xs ${s.entityType==="client"?"bg-blue-500/20 text-blue-400":"bg-orange-500/20 text-orange-400"}`}>{s.entityType}</span></td><td className="p-3">{s.entityName}</td><td className="p-3 font-mono">{s.systemId}</td><td className="p-3">{s.bindType||"TRX"}</td><td className="p-3 text-gray-400">{s.remoteAddress||"-"}</td><td className="p-3"><Badge s={s.bindStatus||"unbound"}/></td><td className="p-3"><button onClick={()=>doRebind(s.entityType,s.entityId)} disabled={rebinding[`${s.entityType}:${s.entityId}`]} className={`px-2 py-0.5 rounded text-[10px] font-medium ${s.bindStatus==="bound"?"bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30":"bg-blue-500/20 text-blue-400 hover:bg-blue-500/30"} disabled:opacity-50`}>{rebinding[`${s.entityType}:${s.entityId}`]?"...":s.bindStatus==="bound"?"Rebind":"Connect"}</button></td></tr>))}</tbody></table></div></div>);
@@ -657,12 +800,16 @@ function PlatformTab() {
 }
 
 function LicenseTab() {
-  const [lic, setLic] = useState<{ id?: number; maxVolume?: number; currentUsage?: number; licenseKey?: string; activePackage?: string; packageVolume?: number; totalPurchased?: number; globalTps?: number; availablePackages?: string[]; packageVolumes?: Record<string, number> } | null>(null);
+  const [lic, setLic] = useState<{ id?: number; maxVolume?: number; currentUsage?: number; licenseKey?: string; activePackage?: string; packageVolume?: number; totalPurchased?: number; globalTps?: number; availablePackages?: string[]; packageVolumes?: Record<string, number>; updatedAt?: string; history?: { id: number; userId?: number; userRole?: string; action: string; details?: unknown; createdAt: string }[] } | null>(null);
   const [sp, setSp] = useState("");
   const [addVol, setAddVol] = useState(0);
   const [deductVol, setDeductVol] = useState(0);
   const [tpsVal, setTpsVal] = useState(200);
   const [msg, setMsg] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [showChangePw, setShowChangePw] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
 
   const load = async () => { const d = await api("/api/license"); if (d && !d.error) { setLic(d); setTpsVal(d.globalTps || 200); } };
   useEffect(() => { load(); }, []);
@@ -682,13 +829,21 @@ function LicenseTab() {
   const deductVolume = async () => {
     if (!sp || deductVol <= 0) { setMsg("Enter password and amount"); return; }
     const r = await api("/api/license", { method: "PUT", body: JSON.stringify({ superPassword: sp, action: "deduct_volume", amount: deductVol }) });
-    if (r.error) { setMsg(r.error); } else { setMsg(`Deducted ${deductVol.toLocaleString()} SMS from usage. New usage: ${(r.currentUsage || 0).toLocaleString()}`); setDeductVol(0); load(); }
+    if (r.error) { setMsg(r.error); } else { setMsg(`Reduced cap by ${deductVol.toLocaleString()} SMS. New max volume: ${(r.maxVolume || 0).toLocaleString()}`); setDeductVol(0); load(); }
   };
 
   const updateTps = async () => {
     if (!sp) { setMsg("Enter super password first"); return; }
     const r = await api("/api/license", { method: "PUT", body: JSON.stringify({ superPassword: sp, action: "update_tps", globalTps: tpsVal }) });
     if (r.error) { setMsg(r.error); } else { setMsg(`Global TPS set to ${tpsVal}`); load(); }
+  };
+
+  const changePassword = async () => {
+    if (!sp) { setMsg("Enter current super password first"); return; }
+    if (!newPw || newPw.length < 6) { setMsg("New password must be at least 6 characters"); return; }
+    if (newPw !== confirmPw) { setMsg("Passwords do not match"); return; }
+    const r = await api("/api/license", { method: "PUT", body: JSON.stringify({ superPassword: sp, action: "change_password", newSuperPassword: newPw }) });
+    if (r.error) { setMsg(r.error); } else { setMsg("Super password updated successfully!"); setNewPw(""); setConfirmPw(""); setSp(""); setShowChangePw(false); load(); }
   };
 
   const packages = lic?.availablePackages || ["trial", "1M", "3M", "5M", "10M", "15M", "30M", "unlimited"];
@@ -785,7 +940,70 @@ function LicenseTab() {
       </div>
 
       <div className="text-[10px] text-gray-600 mt-2 max-w-3xl">
-        <p>Trial: 5,000 SMS automatically assigned | Default TPS: 200 | Default super password: Telco1988</p>
+      {/* Change Super Password */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 max-w-2xl">
+        <button onClick={() => setShowChangePw(!showChangePw)} className="flex items-center gap-2 text-xs text-gray-400 hover:text-white transition">
+          <span className="text-lg">{showChangePw ? "🔽" : "🔒"}</span>
+          {showChangePw ? "Hide Change Password" : "Change Super Password"}
+        </button>
+        {showChangePw && (
+          <div className="mt-3 space-y-3">
+            <p className="text-[10px] text-gray-500">The super password is independent of your login password and was randomly generated during install. Rotate it using the form below — the change takes effect immediately for all subsequent license actions.</p>
+            {lic?.updatedAt && <p className="text-[10px] text-gray-500">🕐 Last changed: <span className="text-gray-300">{new Date(lic.updatedAt).toLocaleString()}</span></p>}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+              <div>
+                <label className="text-[10px] text-gray-500">Current Password *</label>
+                <input type="password" value={sp} onChange={e => setSp(e.target.value)} placeholder="Current super password"
+                  className="w-full mt-0.5 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-red-500 focus:outline-none" />
+              </div>
+              <div>
+                <label className="text-[10px] text-gray-500">New Password *</label>
+                <input type="password" value={newPw} onChange={e => setNewPw(e.target.value)} placeholder="Min 6 characters"
+                  className="w-full mt-0.5 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none" />
+              </div>
+              <div>
+                <label className="text-[10px] text-gray-500">Confirm New Password *</label>
+                <input type="password" value={confirmPw} onChange={e => setConfirmPw(e.target.value)} placeholder="Re-type new password"
+                  className="w-full mt-0.5 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-white focus:ring-1 focus:ring-blue-500 focus:outline-none" />
+              </div>
+            </div>
+            <button onClick={changePassword} className="px-4 py-2 bg-red-600 text-white rounded text-xs hover:bg-red-500 font-semibold">
+              🔒 Update Super Password
+            </button>
+          </div>
+        )}
+      </div>
+      {/* License Action History */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 max-w-2xl mt-3">
+        <button onClick={() => setShowHistory(!showHistory)} className="flex items-center gap-2 text-xs text-gray-400 hover:text-white transition">
+          <span className="text-lg">{showHistory ? "🔽" : "📜"}</span>
+          {showHistory ? "Hide History" : `License Action History${lic?.history?.length ? ` (${lic.history.length})` : ""}`}
+        </button>
+        {showHistory && (
+          <div className="mt-3">
+            {(!lic?.history || lic.history.length === 0) ? (
+              <p className="text-[10px] text-gray-600 py-3 text-center">No license actions recorded yet.</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-[10px]">
+                  <thead><tr className="text-gray-500 border-b border-gray-800 text-left">
+                    <th className="p-2">Time</th><th className="p-2">User</th><th className="p-2">Action</th><th className="p-2">Details</th>
+                  </tr></thead>
+                  <tbody>{lic.history.map((h: { id: number; userId?: number; userRole?: string; action: string; details?: unknown; createdAt: string }) => (
+                    <tr key={h.id} className="border-b border-gray-800/30 hover:bg-gray-800/20">
+                      <td className="p-2 text-gray-400 whitespace-nowrap">{new Date(h.createdAt).toLocaleString()}</td>
+                      <td className="p-2"><span className={`px-1.5 py-0.5 rounded text-[9px] ${h.userRole === "superuser" ? "bg-red-500/20 text-red-400" : "bg-gray-700 text-gray-400"}`}>{h.userRole || "?"}</span></td>
+                      <td className="p-2 font-medium text-gray-300">{h.action.replace(/_/g, " ")}</td>
+                      <td className="p-2 text-gray-500 font-mono max-w-[250px] truncate">{h.details ? JSON.stringify(h.details) : "-"}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+        <p>Trial: 5,000 SMS assigned on install | Default TPS: 200 | Super password is randomly generated during install (rotate via the form above)</p>
         <p>All packages: 1M = 1,000,000 | 3M | 5M | 10M | 15M | 30M SMS</p>
       </div>
     </div>
